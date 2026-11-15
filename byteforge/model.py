@@ -33,3 +33,47 @@ class ByteForgeError(Exception):
             f"{location.text}\n"
             f"{padding}^"
         )
+
+
+@dataclass(frozen=True)
+class Register:
+    name: str
+    code: int
+    width: int
+    location: SourceLocation
+
+
+@dataclass(frozen=True)
+class Immediate:
+    value: int
+    location: SourceLocation
+
+
+@dataclass(frozen=True)
+class SymbolReference:
+    name: str
+    location: SourceLocation
+
+
+@dataclass(frozen=True)
+class Instruction:
+    mnemonic: str
+    operands: tuple[Register | Immediate | SymbolReference, ...]
+    location: SourceLocation
+
+
+@dataclass(frozen=True)
+class Label:
+    name: str
+    location: SourceLocation
+
+
+@dataclass(frozen=True)
+class DataDirective:
+    data: bytes
+    location: SourceLocation
+
+
+@dataclass(frozen=True)
+class Program:
+    statements: list[Instruction | Label | DataDirective]

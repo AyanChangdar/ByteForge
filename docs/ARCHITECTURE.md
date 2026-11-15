@@ -47,26 +47,39 @@ ByteForge/
 `-- build/                 # ignored generated artifacts
 ```
 
-Only the documentation files exist at the architecture stage. Implementation
-folders should be added after architecture review.
+The diagnostic model and minimal parser are implemented. The rest of this
+tree describes planned components.
 
 ## 3. Shared data model and interfaces
 
 `model.py` is the contract between modules. Use dataclasses and enums rather
 than passing loosely structured dictionaries through the assembler core.
 
-Suggested types:
+Implemented parser types (all frozen dataclasses):
 
 ```python
 SourceLocation(filename: str, line: int, column: int, text: str)
-Register(name: str, code: int, width: int)
-Immediate(value: int)
-SymbolRef(name: str)
-StringLiteral(value: bytes)
-Instruction(mnemonic: str, operands: tuple, location: SourceLocation)
+Register(name: str, code: int, width: int, location: SourceLocation)
+Immediate(value: int, location: SourceLocation)
+SymbolReference(name: str, location: SourceLocation)
+Instruction(mnemonic: str,
+            operands: tuple[Register | Immediate | SymbolReference, ...],
+            location: SourceLocation)
 Label(name: str, location: SourceLocation)
-DataDirective(label: str | None, data: bytes, location: SourceLocation)
-Program(statements: list)
+DataDirective(data: bytes, location: SourceLocation)
+Program(statements: list[Instruction | Label | DataDirective])
+```
+
+`Program` preserves source statement order. Its field cannot be reassigned,
+but its list remains mutable. A labeled instruction or directive produces a
+separate `Label` followed by that statement; data directives never own labels.
+Operands retain their own locations for later encoder/resolver diagnostics.
+Register codes are `rax=0`, `rcx=1`, `rdx=2`, `rbx=3`, `rsp=4`, `rbp=5`,
+`rsi=6`, `rdi=7`, with width 64.
+
+Planned downstream types:
+
+```python
 EncodedItem(address: int, data: bytes, statement, resolution: dict)
 AssemblyResult(code: bytes, data: bytes, symbols: dict, items: list)
 ElfLayout(entry: int, segments: list, file_size: int)
@@ -77,7 +90,7 @@ The implemented diagnostic contract is `SourceLocation` and
 `SourceLocation` is an immutable dataclass. Its `text` field preserves the
 original source line, including whitespace, without the line terminator.
 Callers supply one-based line and column numbers; columns count Python string
-characters, not terminal display cells. The remaining types above are planned.
+characters, not terminal display cells.
 
 `ByteForgeError` exposes `location` and `message`. Calling `str(error)` returns:
 
@@ -115,24 +128,53 @@ print output, parse command-line arguments, or import the visualizer.
 
 ### Stage 1: Parse and validate syntax
 
-The parser reads one line at a time, strips `;` comments outside quoted
-strings, recognizes optional labels, and converts instructions and data
-directives into typed statements. Mnemonics and register names are normalized
-to lowercase. Integers use decimal or `0x` hexadecimal syntax, with an
-optional leading minus sign where the selected encoding permits it.
+`parse(source: str, filename: str) -> Program` scans one line at a time,
+recognizes quoted strings before interpreting `;` comments, and produces typed
+statements without file I/O or printing. LF, CRLF and CR line endings are
+accepted. Original lines, including whitespace and comments, are retained in
+source locations without line terminators. Mnemonic/directive locations point
+to their first character; labels and operands point to their own first
+characters. Missing input is marked immediately after the last syntactic token,
+before trailing whitespace or a comment. Parsing stops at the first
+`ByteForgeError`.
 
-Recommended grammar for the first version:
+Implemented Milestone 2 grammar:
 
 ```text
 line       := [label ":"] [instruction | data] [";" comment]
-instruction:= mnemonic [operand ["," operand]]
-operand    := register | integer | identifier
-data       := "db" string ["," integer ...]
+instruction:= "mov" register "," (integer | identifier) | "syscall"
+data       := "db" value ["," value ...]
+value      := string | integer
+integer    := ["+" | "-"] (decimal_digits | "0x" hexadecimal_digits)
 ```
 
-Labels use `[A-Za-z_][A-Za-z0-9_]*`. Reject duplicate labels, malformed
-strings, unsupported mnemonics, wrong operand counts, unknown registers, and
-out-of-range immediates with filename, line, column, and source context.
+Mnemonics and registers are case-insensitive and normalize to lowercase;
+hexadecimal prefixes may also be `0X`. Decimal literals with leading zeros
+remain decimal. Labels and symbol references match `[A-Za-z_][A-Za-z0-9_]*`
+and preserve case. Only one label is allowed per line. References remain
+unresolved; duplicate/undefined symbols and the required `_start` entry are
+deferred to assembly. The parser does not require an entry point.
+
+MOV destinations must be one of the eight supported registers. Supported
+registers in source position are rejected because register-to-register MOV is
+deferred. Unsupported general-purpose register spellings (`eax`, `ax`, `al`,
+`r8` through `r15` and their width variants, and instruction-pointer names)
+are reserved and rejected in operand positions. Other identifiers, including
+`raq` or `r8_buffer`, are permitted as symbolic sources. MOV immediate values
+retain their integer value; encoding-width validation belongs to the encoder.
+Python's integer conversion limits may reject exceptionally large literals.
+
+DB accepts a nonempty comma-separated sequence of double-quoted ASCII strings
+and numeric bytes in `0..255`. Empty strings are allowed. Strings support only
+`\\`, `\"`, `\n`, `\r`, `\t`, and `\0` escapes. Unknown escapes,
+non-ASCII characters, unterminated strings and invalid numeric bytes are errors.
+Commas, colons and semicolons inside strings are literal characters.
+
+Missing/extra operands, missing commas, malformed labels/numbers, unsupported
+instructions/registers and incorrect operand combinations raise source-located
+diagnostics. Expressions, memory operands, register-to-register MOV,
+single-quoted/multiline strings, sections and macros are unsupported. No
+addresses, instruction sizes or machine code are calculated by the parser.
 
 ### Stage 2: Layout and collect symbols
 
@@ -211,7 +253,9 @@ and an ELF layout diagram. It does not execute or emulate instructions.
 
 ## 5. Supported instruction forms
 
-Keep the encoding matrix explicit and small. The minimum planned forms are:
+Keep the encoding matrix explicit and small. Milestone 2 implements parsing
+only for `MOV r64, integer/symbol` and `SYSCALL`; there is no encoder yet.
+The complete target matrix below remains planned:
 
 | Instruction | Operand form | Purpose |
 |---|---|---|
