@@ -58,7 +58,7 @@ than passing loosely structured dictionaries through the assembler core.
 Suggested types:
 
 ```python
-SourceLocation(line: int, column: int, text: str)
+SourceLocation(filename: str, line: int, column: int, text: str)
 Register(name: str, code: int, width: int)
 Immediate(value: int)
 SymbolRef(name: str)
@@ -71,6 +71,30 @@ EncodedItem(address: int, data: bytes, statement, resolution: dict)
 AssemblyResult(code: bytes, data: bytes, symbols: dict, items: list)
 ElfLayout(entry: int, segments: list, file_size: int)
 ```
+
+The implemented diagnostic contract is `SourceLocation` and
+`ByteForgeError(location: SourceLocation, message: str)` in `model.py`.
+`SourceLocation` is an immutable dataclass. Its `text` field preserves the
+original source line, including whitespace, without the line terminator.
+Callers supply one-based line and column numbers; columns count Python string
+characters, not terminal display cells. The remaining types above are planned.
+
+`ByteForgeError` exposes `location` and `message`. Calling `str(error)` returns:
+
+```text
+filename:line:column: message
+original source line
+    ^
+```
+
+The caret uses `column - 1` characters of padding. For defensive formatting,
+columns below 1 place it at the start, and columns beyond the line place it
+immediately after the last character. Empty lines place it at the start.
+The stored location and header values are never clamped or rewritten. Tabs
+are preserved in caret padding; other preceding characters become spaces.
+Terminal display widths for Unicode characters are not calculated.
+Neither class reads or writes files or prints output. The parser will attach
+locations to errors; the CLI will eventually catch and display them.
 
 The concrete fields may be refined during implementation, but module
 ownership and return directions should remain stable:
