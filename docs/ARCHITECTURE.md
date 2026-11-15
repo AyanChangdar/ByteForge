@@ -47,8 +47,8 @@ ByteForge/
 `-- build/                 # ignored generated artifacts
 ```
 
-The diagnostic model and minimal parser are implemented. The rest of this
-tree describes planned components.
+The diagnostic model, minimal parser and minimal instruction encoder are
+implemented. The rest of this tree describes planned components.
 
 ## 3. Shared data model and interfaces
 
@@ -253,9 +253,16 @@ and an ELF layout diagram. It does not execute or emulate instructions.
 
 ## 5. Supported instruction forms
 
-Keep the encoding matrix explicit and small. Milestone 2 implements parsing
-only for `MOV r64, integer/symbol` and `SYSCALL`; there is no encoder yet.
-The complete target matrix below remains planned:
+Keep the encoding matrix explicit and small. The parser accepts
+`MOV r64, integer/symbol` and `SYSCALL`. Milestone 3 encodes only these forms:
+
+| Instruction | Operand form | Bytes | Size |
+|---|---|---|---|
+| `MOV` | base `r64, integer` | `48`, `B8 + register_code`, little-endian imm64 | 10 |
+| `SYSCALL` | no operands | `0F 05` | 2 |
+
+Symbolic MOV remains parser-only and is rejected by the encoder, even when
+the supplied symbol mapping contains its name. The complete target matrix is:
 
 | Instruction | Operand form | Purpose |
 |---|---|---|
@@ -304,9 +311,59 @@ length is a literal in version one; computed expressions such as
 ## 6. Instruction encoding boundaries
 
 The encoder owns opcode selection, REX prefixes, ModR/M bytes, immediate
-width/range checks, and little-endian packing. It should use a small dispatch
-table keyed by `(mnemonic, operand kinds)` and dedicated helpers, not a generic
-x86 description language.
+width/range checks, and little-endian packing. The minimal implementation uses
+a small form-size table keyed by `(mnemonic, operand kinds)`, shared validation
+and direct encoding functions. Extend this with dedicated handlers as forms
+are added; do not introduce a generic x86 description language.
+
+Implemented public interfaces remain:
+
+```python
+encoded_size(instruction: Instruction) -> int
+encode(instruction: Instruction, address: int,
+       symbols: Mapping[str, int]) -> bytes
+```
+
+Both functions validate the form, operand count/types, base-register
+name/code/width consistency and immediate range. They consume the parser's
+normalized lowercase models. Invalid operands use their own source location;
+unsupported mnemonics or wrong operand counts use the instruction location.
+Errors are `ByteForgeError`, with no file I/O or printing. Address and symbol
+arguments are retained for future forms but are unused in Milestone 3.
+
+MOV accepts integers from `-2^63` through `2^64-1` inclusive. Negative values
+use their 64-bit two's-complement representation. Values are range-checked
+before masking and packed with `struct.pack("<Q", ...)`; out-of-range values
+are rejected rather than truncated. Noninteger values in constructed
+`Immediate` models are rejected. MOV always uses the ten-byte form, including
+for zero or small immediates. SYSCALL is always two bytes.
+
+Current private helpers are `_base_register_code(register)` for register
+validation, `_rex(w, r=0, x=0, b=0)` for prefix composition, and
+`_pack_imm64(value, location)` for validated little-endian immediate bytes.
+`_imm64_bits(value, location)` shares range validation between sizing and
+packing. REX is `0x40 | W<<3 | R<<2 | X<<1 | B`; current MOV sets only W.
+The encoder checks register metadata independently of the parser, so manually
+constructed mismatched registers cannot silently select another destination.
+
+Future helper designs (not implemented in this milestone):
+
+- `_modrm_register(reg_code, rm_code)` will compose register-only ModR/M:
+  `0xC0 | (reg_code << 3) | rm_code`, after base-register validation. Opcode
+  handlers will explicitly choose register direction or the opcode extension.
+- `_pack_signed(value, bits, location)` will check signed ranges and use
+  explicit little-endian formats for arithmetic immediates and displacements.
+- `_rel32(target, address, instruction_size, location)` will calculate
+  `target - (address + instruction_size)`, require signed 32-bit range and
+  pack with `<i`. JMP remains five bytes, JE/JNE six; no branch relaxation.
+
+Later symbolic MOV and branch handlers can consume the existing
+`SymbolReference`, address and symbol mapping without changing public
+interfaces. Sizing must accept unresolved references once those forms are
+introduced. Arithmetic/register forms fit the existing operand models, but
+will require approved parser extensions. The future resolver will own layout
+and symbols; the ELF writer will consume assembled bytes downstream. No
+additional instruction, symbol lookup or branch logic is implemented yet.
 
 Important fixed choices:
 
