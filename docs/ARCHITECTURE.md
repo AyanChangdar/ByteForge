@@ -35,6 +35,7 @@ ByteForge/
 |   |-- styles.css
 |   `-- app.js
 |-- examples/
+|   |-- exit.asm          # implemented exit-status-7 demo
 |   |-- hello.asm
 |   |-- loop.asm
 |   `-- conditional.asm
@@ -47,8 +48,9 @@ ByteForge/
 `-- build/                 # ignored generated artifacts
 ```
 
-The diagnostic model, minimal parser and minimal instruction encoder are
-implemented. The rest of this tree describes planned components.
+Milestone 4 implements the model, parser, encoder, resolver, ELF writer, CLI,
+exit example and their tests. Reports, visualization and the other examples
+remain planned.
 
 ## 3. Shared data model and interfaces
 
@@ -77,13 +79,25 @@ Operands retain their own locations for later encoder/resolver diagnostics.
 Register codes are `rax=0`, `rcx=1`, `rdx=2`, `rbx=3`, `rsp=4`, `rbp=5`,
 `rsi=6`, `rdi=7`, with width 64.
 
-Planned downstream types:
+Implemented downstream contracts (also frozen dataclasses):
 
 ```python
-EncodedItem(address: int, data: bytes, statement, resolution: dict)
-AssemblyResult(code: bytes, data: bytes, symbols: dict, items: list)
-ElfLayout(entry: int, segments: list, file_size: int)
+EncodedItem(address: int, data: bytes, statement: Instruction,
+            resolution: dict[str, int])
+AssemblyResult(code: bytes, data: bytes, symbols: dict[str, int],
+               items: list[EncodedItem])
+ElfConfig(image_base: int = 0x400000, code_offset: int = 0x1000,
+          alignment: int = 0x1000)
+ElfSegment(p_type: int, p_flags: int, p_offset: int, p_vaddr: int,
+           p_paddr: int, p_filesz: int, p_memsz: int, p_align: int)
+ElfLayout(entry: int, segments: list[ElfSegment], file_size: int)
 ```
+
+Each encoded item retains its original instruction and location. Resolution
+metadata defaults to an independently allocated empty dictionary in this
+milestone; `AssemblyResult.data` is empty. Frozen result objects contain ordinary
+mutable collections, which callers should treat as read-only. ElfConfig names
+the fixed layout; the writer rejects configurations other than approved defaults.
 
 The implemented diagnostic contract is `SourceLocation` and
 `ByteForgeError(location: SourceLocation, message: str)` in `model.py`.
@@ -116,7 +130,8 @@ ownership and return directions should remain stable:
 - `encoder.encoded_size(instruction: Instruction) -> int`
 - `encoder.encode(instruction: Instruction, address: int,
   symbols: Mapping[str, int]) -> bytes`
-- `resolver.assemble(program: Program, base_address: int) -> AssemblyResult`
+- `resolver.assemble(program: Program, base_address: int,
+  *, filename: str = "<input>") -> AssemblyResult`
 - `elf.build_executable(result: AssemblyResult,
   config: ElfConfig) -> tuple[bytes, ElfLayout]`
 - `report.build_report(program, result, elf_layout) -> dict`
@@ -178,40 +193,43 @@ addresses, instruction sizes or machine code are calculated by the parser.
 
 ### Stage 2: Layout and collect symbols
 
-The resolver performs pass 1 over the parsed program. It asks the encoder for
-each instruction's exact size and assigns offsets to instructions, labels, and
-data. To keep layout deterministic, all `JMP`, `JE`, and `JNE` instructions use
-their near `rel32` forms; ByteForge does not relax them into short branches.
+The resolver performs pass 1 over the parsed program. It asks the existing
+encoder for each instruction's exact size and collects labels at the current
+instruction address. `base_address` means the virtual address of the first
+code byte, not the ELF image base. DB directives (including empty ones),
+symbolic MOV and unsupported instructions are rejected. Every duplicate label
+is an error at the second definition. `_start` is case-sensitive, required,
+and must identify an instruction boundary; an entry at end-of-code is rejected.
 
-The first implementation should place code followed by read-only string data
-inside one loadable segment. This avoids section-table complexity and still
-produces a valid native executable. Symbol values are final virtual addresses:
+Symbol values are virtual addresses. The CLI passes
+`ElfConfig.image_base + ElfConfig.code_offset` as the code base:
 
 ```text
-symbol address = image base + load segment file offset + item offset
+symbol address = image base + code file offset + instruction offset
 ```
 
-Pass 1 fails on duplicate definitions. References may remain unresolved until
-pass 2, allowing forward branches and forward references to data.
+For a missing `_start`, the diagnostic uses the first statement's location.
+An empty program uses `filename:1:1` and empty source text; the CLI supplies
+the input filename through the optional keyword. Labels need no source
+references to be collected, but general symbol-reference encoding is deferred.
 
 ### Stage 3: Encode and resolve references
 
-Pass 2 encodes every instruction with the final symbol table.
+Pass 2 calls the existing `encode(instruction, address, symbols)` with the
+final addresses and label table. Every emitted length must match its planned
+size; a mismatch raises a source-located `ByteForgeError`. No file I/O or
+printing occurs. The encoder still rejects symbolic MOV even when the target
+is defined. `AssemblyResult.items` preserves code bytes and source metadata.
 
-- A near branch uses `disp32 = target - address_after_instruction`.
-- A symbolic `MOV r64, label` uses the resolved 64-bit virtual address as its
-  immediate. This is valid because the first version emits fixed-address
-  `ET_EXEC`, not PIE.
-- Missing symbols and values outside their encoding range are errors.
-
-`AssemblyResult.items` retains source location, virtual address, bytes, and
-resolution details so the visualizer does not need to reverse-engineer the
-binary.
+Future near branches will use `disp32 = target - address_after_instruction`,
+and symbolic MOV will encode the resolved address as imm64. Those features,
+including undefined-reference diagnostics, are not implemented in Milestone 4.
 
 ### Stage 4: Build the ELF64 executable
 
-`elf.py` constructs the file with `struct.pack` using explicit little-endian
-formats. The minimum image is:
+`elf.py` builds bytes in memory using explicit little-endian struct formats:
+`<16sHHIQQQIHHHHHH` (64-byte ELF header) and `<IIQQQQQQ` (56-byte program
+header). The single PT_LOAD maps the entire file, including headers and padding.
 
 ```text
 +------------------------+ file offset 0
@@ -220,22 +238,39 @@ formats. The minimum image is:
 | Program header         | 56 bytes, PT_LOAD
 +------------------------+
 | padding/alignment      |
-+------------------------+ load segment offset
++------------------------+ code file offset 0x1000
 | encoded instructions   | entry points to _start
-| string data            |
 +------------------------+
 ```
 
-Required ELF properties are `ELFCLASS64`, little endian, System V ABI,
-`ET_EXEC`, `EM_X86_64`, and one `PT_LOAD` segment. The segment can be `PF_R |
-PF_X` for the demonstration because strings are read-only. No section-header
-table is required for execution. File offset and virtual address congruence
-must satisfy the selected `p_align` (normally `0x1000`). `_start` is required
-and becomes `e_entry`.
+The fixed image base is `0x400000`; code starts at virtual address `0x401000`.
+The header identity is ELFCLASS64, little endian, current version, System V
+ABI. Type is ET_EXEC (2), machine EM_X86_64 (62), version 1 and flags 0.
+`e_phoff=64`, `e_ehsize=64`, `e_phentsize=56`, `e_phnum=1`. All section-header
+fields are zero. There is no interpreter or dynamic-linking metadata.
 
-The CLI writes the completed bytes and applies executable permission bits on
-POSIX. On Windows it still creates the ELF file, which must be copied to Linux
-or WSL for execution.
+The segment has `p_type=1`, `p_flags=5` (read/execute), `p_offset=0`,
+`p_vaddr=p_paddr=0x400000`, `p_filesz=p_memsz=len(image)`, and `p_align=0x1000`.
+Virtual address and file offset are congruent modulo alignment. Padding from
+file offset 120 to 4096 is zero. `_start` supplies `e_entry`; it is not assumed
+to be the first instruction. The exit example has entry `0x401000`, 22 code
+bytes and a 4118-byte file. Data payloads are rejected.
+
+The writer validates struct sizes, the fixed layout/alignment, assembly item
+addresses, payload consistency, total length, 64-bit bounds and entry range
+and instruction boundary. Invalid internal configuration/result contracts
+raise `ValueError`; source errors use `ByteForgeError` earlier in the pipeline.
+The writer performs no file I/O or printing.
+
+The CLI uses `python -m byteforge.cli examples/exit.asm -o build/exit` and
+composes parse, assemble and build_executable. It reads UTF-8 input and builds
+the complete image before creating output directories and exclusively creating
+the output file. Existing output and input/output path equality are rejected.
+It adds owner-execute permission on POSIX, displays a byte count and entry on
+success, and displays structured source diagnostics or file errors on failure.
+Exit codes are 0 for success, 1 for build/file errors and 2 for argument errors.
+It never runs generated programs. On Windows the file must be copied to Linux
+or compatible WSL and given executable permission there as needed.
 
 ### Stage 5: Generate the visualization report
 
@@ -361,9 +396,9 @@ Later symbolic MOV and branch handlers can consume the existing
 `SymbolReference`, address and symbol mapping without changing public
 interfaces. Sizing must accept unresolved references once those forms are
 introduced. Arithmetic/register forms fit the existing operand models, but
-will require approved parser extensions. The future resolver will own layout
-and symbols; the ELF writer will consume assembled bytes downstream. No
-additional instruction, symbol lookup or branch logic is implemented yet.
+will require approved parser extensions. The resolver now owns instruction
+layout and label collection; the ELF writer consumes assembled bytes downstream.
+No additional instruction, symbol-reference encoding or branch logic is implemented yet.
 
 Important fixed choices:
 
