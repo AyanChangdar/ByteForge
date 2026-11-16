@@ -49,10 +49,10 @@ ByteForge/
 `-- build/                 # ignored generated artifacts
 ```
 
-Stage 5B.1 extends the existing pipeline with fixed-imm32 ADD, SUB, CMP and
-register-register XOR, plus an arithmetic example. MOV-immediate/symbol,
-SYSCALL, code/data layout, ELF generation and the CLI remain supported.
-Branches, reports and visualization remain planned.
+Stage 5B.2 adds fixed-width JMP, JE and JNE to the existing MOV, arithmetic,
+XOR and SYSCALL pipeline. Loop and conditional examples supplement the exit,
+Hello World and arithmetic demos. Code/data layout and the fixed ELF format
+are preserved. Reports and visualization remain planned.
 
 ## 3. Shared data model and interfaces
 
@@ -157,13 +157,14 @@ characters. Missing input is marked immediately after the last syntactic token,
 before trailing whitespace or a comment. Parsing stops at the first
 `ByteForgeError`.
 
-Implemented Stage 5B.1 grammar:
+Implemented Stage 5B.2 grammar:
 
 ```text
 line       := [label ":"] [instruction | data] [";" comment]
 instruction:= "mov" register "," (integer | identifier) | "syscall"
             | ("add" | "sub" | "cmp") register "," integer
             | "xor" register "," register
+            | ("jmp" | "je" | "jne") identifier
 data       := "db" value ["," value ...]
 value      := string | integer
 integer    := ["+" | "-"] (decimal_digits | "0x" hexadecimal_digits)
@@ -191,7 +192,9 @@ The parser rejects arithmetic symbols/register sources, XOR immediates,
 memory operands, unsupported registers and wrong operand counts. Encoding-width
 range checks remain in the encoder. Existing quoting, comments, labels, DB,
 numeric literal rules and source-location conventions are unchanged. JMP,
-JE and JNE are still unknown instructions in Stage 5B.1.
+JE and JNE require exactly one label identifier and preserve its spelling.
+Numeric, register, string, expression and memory branch targets are rejected.
+Register spellings are reserved in branch operand position, as in symbolic MOV.
 
 DB accepts a nonempty comma-separated sequence of double-quoted ASCII strings
 and numeric bytes in `0..255`. Empty strings are allowed. Strings support only
@@ -246,8 +249,18 @@ Undefined symbols raise `ByteForgeError` at the symbol operand's location.
 `AssemblyResult.items` preserves code bytes and source/resolution metadata;
 `code` and `data` remain separate payloads.
 
-Future near branches will use `disp32 = target - address_after_instruction`.
-Branching and symbol expressions remain unsupported.
+After pass 1, the resolver constructs the set of planned instruction-start
+addresses and uses it for entry and branch validation. Before encoding each
+JMP/JE/JNE, it checks that the case-sensitive target exists and belongs to that
+set. Code aliases are allowed; targets in DB data (including empty directives),
+at end-of-code or inside an instruction are rejected at the operand location.
+Instructions after DB remain unsupported. Symbolic MOV still accepts code or
+data addresses, including addresses that are not valid branch destinations.
+
+Branch displacement is `target - (instruction_address + fixed_size)`.
+Forward/backward references use the completed table; no instruction size or
+address changes during pass 2. Existing size-mismatch checks remain in force.
+Symbol expressions, indirect branches and branch relaxation remain unsupported.
 
 ### Stage 4: Build the ELF64 executable
 
@@ -317,7 +330,7 @@ and an ELF layout diagram. It does not execute or emulate instructions.
 
 ## 5. Supported instruction forms
 
-Keep the encoding matrix explicit and small. Stage 5B.1 supports exactly
+Keep the encoding matrix explicit and small. Stage 5B.2 supports exactly
 the following instruction forms, using only the eight base 64-bit registers:
 
 | Instruction | Operand form | Bytes | Size |
@@ -329,10 +342,13 @@ the following instruction forms, using only the eight base 64-bit registers:
 | `SUB` | base `r64, signed imm32` | `48 81`, ModR/M `/5`, imm32 | 7 |
 | `CMP` | base `r64, signed imm32` | `48 81`, ModR/M `/7`, imm32 | 7 |
 | `XOR` | base `r64, r64` | `48 31`, register-direct ModR/M | 3 |
+| `JMP` | label | `E9`, signed little-endian rel32 | 5 |
+| `JE` | label | `0F 84`, signed little-endian rel32 | 6 |
+| `JNE` | label | `0F 85`, signed little-endian rel32 | 6 |
 
 DB is supported only after instructions. Arithmetic imm8 optimizations,
-register-register ADD/SUB/CMP, register-register MOV, XOR immediates and all
-branches are unsupported. The broader target matrix below includes deferred
+register-register ADD/SUB/CMP, register-register MOV, XOR immediates, indirect
+branches and other branch mnemonics are unsupported. The broader target matrix below includes deferred
 forms and must not be read as the implemented subset:
 
 | Instruction | Operand form | Purpose |
@@ -404,7 +420,13 @@ accepts unresolved symbols and returns 10 without a symbol lookup, enabling
 forward references. `encode()` resolves symbolic operands through the supplied
 mapping. Absolute symbol values must be integers in `0..2^64-1`; negative,
 overflowing and noninteger mapped values are rejected at the symbol location.
-The instruction address argument is retained for future relative forms.
+For JMP/JE/JNE, sizing accepts unresolved symbols and returns the fixed size
+without lookup. Encoding uses the actual instruction address and final symbol
+mapping to compute the next-instruction-relative displacement. Out-of-range
+signed rel32 values raise `ByteForgeError` at the target operand. The encoder
+also rejects invalid unsigned target addresses and invalid instruction-address
+ranges. Direct `encode()` callers supply addresses only; instruction-boundary
+validation requires the complete program and belongs to the resolver.
 
 MOV accepts integers from `-2^63` through `2^64-1` inclusive. Negative values
 use their 64-bit two's-complement representation. Values are range-checked
@@ -426,7 +448,20 @@ and the second occupies reg. Thus `xor rax, rbx` is `48 31 D8`; reversing the
 operands gives different bytes and changes the destination. XOR is three bytes.
 All register metadata is validated by both sizing and encoding. The arithmetic
 demo is 36 code bytes (4132 ELF bytes), enters at `0x401000` and computes exit
-status 7. CMP changes flags only; conditional use awaits Stage 5B.2.
+status 7. CMP changes flags only; JE tests ZF=1 and JNE tests ZF=0.
+
+Branch encodings contain no REX prefix. `_rel32(target, address, size, location)`
+checks `-2147483648..2147483647` and packs the displacement using `<i`.
+The emitted branch length is checked against the form-size table.
+At `0x401000` targeting `0x401010`, JMP is `E9 0B 00 00 00`, JE is
+`0F 84 0A 00 00 00` and JNE is `0F 85 0A 00 00 00`. No short forms are selected.
+
+The loop demo decrements RCX from 3, compares it with zero and branches back.
+Its JNE at `0x401018` targets `0x40100A`: displacement
+`0x40100A - 0x40101E = -20`, bytes `0F 85 EC FF FF FF`. It has 52 code bytes
+and a 4148-byte ELF. The conditional demo uses a non-taken JNE followed by a
+taken JE; success selects exit status 7 instead of the failure status 99.
+It has 66 code bytes and a 4162-byte ELF. Both enter at `0x401000`.
 
 Current private helpers are `_base_register_code(register)` for register
 validation, `_rex(w, r=0, x=0, b=0)` for prefix composition, and
@@ -443,16 +478,13 @@ Future helper designs (not implemented in this milestone):
 
 - `_pack_signed(value, bits, location)` will check signed ranges and use
   explicit little-endian formats if additional signed widths become necessary.
-- `_rel32(target, address, instruction_size, location)` will calculate
-  `target - (address + instruction_size)`, require signed 32-bit range and
-  pack with `<i`. JMP remains five bytes, JE/JNE six; no branch relaxation.
 
 Symbolic MOV uses the existing `SymbolReference` and symbol mapping without
-changing public interfaces. Future branch handlers can use the address and
-mapping similarly. Stage 5B.1 arithmetic reuses the existing operand models and
-public signatures. The unchanged resolver owns instruction/data
-layout and label collection; the ELF writer consumes the separate payloads.
-No branch logic or additional executable format is implemented.
+changing public interfaces. Branch handlers use the existing address and
+mapping arguments and the existing SymbolReference model. The resolver owns
+instruction/data layout, label collection and branch-boundary validation;
+the unchanged ELF writer consumes the separate payloads. No additional
+executable format or instruction family is implemented.
 
 Important fixed choices:
 

@@ -7,6 +7,15 @@ from byteforge.model import (
 )
 
 
+def _validate_branch_target(
+    target: SymbolReference, symbols: dict[str, int], instruction_starts: set[int]
+) -> None:
+    if target.name not in symbols:
+        raise ByteForgeError(target.location, f"Undefined symbol: {target.name}")
+    if symbols[target.name] not in instruction_starts:
+        raise ByteForgeError(target.location, f"Branch target must identify an instruction boundary: {target.name}")
+
+
 def assemble(
     program: Program, base_address: int, *, filename: str = "<input>"
 ) -> AssemblyResult:
@@ -47,11 +56,14 @@ def assemble(
 
     if "_start" not in symbols:
         raise ByteForgeError(fallback, "Required entry label _start is missing")
-    if symbols["_start"] not in {item_address for _, item_address, _ in planned}:
+    instruction_starts = {item_address for _, item_address, _ in planned}
+    if symbols["_start"] not in instruction_starts:
         raise ByteForgeError(definitions["_start"], "_start must identify an instruction, not the end of code or data")
 
     items = []
     for instruction, item_address, size in planned:
+        if instruction.mnemonic in ("jmp", "je", "jne"):
+            _validate_branch_target(instruction.operands[0], symbols, instruction_starts)
         data = encode(instruction, item_address, symbols)
         if len(data) != size:
             raise ByteForgeError(instruction.location, "Encoder size mismatch during assembly")

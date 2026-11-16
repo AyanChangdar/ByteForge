@@ -4,9 +4,9 @@ from dataclasses import replace
 import unittest
 from unittest.mock import patch
 
-from byteforge.model import ByteForgeError, SourceLocation
+from byteforge.model import ByteForgeError, SourceLocation, SymbolReference
 from byteforge.parser import parse
-from byteforge.resolver import assemble
+from byteforge.resolver import assemble, _validate_branch_target
 
 
 EXIT_SOURCE = "_start:\nmov rax, 60\nmov rdi, 7\nsyscall"
@@ -201,8 +201,123 @@ class ResolverTests(unittest.TestCase):
 
     def test_unsupported_instruction_is_rejected(self):
         program = parse("_start: syscall", "a.asm")
-        program.statements[1] = replace(program.statements[1], mnemonic="jmp")
+        program.statements[1] = replace(program.statements[1], mnemonic="nop")
         with self.assertRaisesRegex(ByteForgeError, "Unsupported instruction"):
+            assemble(program, 0x401000)
+
+    def test_forward_branches_skip_exact_instruction_bytes(self):
+        for mnemonic, opcode, size in (("jmp", "E9", 5), ("je", "0F 84", 6), ("jne", "0F 85", 6)):
+            with self.subTest(mnemonic=mnemonic):
+                program = parse(f"_start: {mnemonic} target\nmov rax, 0\ntarget: syscall", "a.asm")
+                result = assemble(program, 0x401000)
+                self.assertEqual(result.symbols["target"], 0x401000 + size + 10)
+                self.assertEqual(result.items[0].data, bytes.fromhex(opcode + " 0A 00 00 00"))
+                self.assertEqual(result.items[0].resolution, {"target": 0x401000 + size + 10})
+                self.assertEqual(result.items[-1].address, result.symbols["target"])
+
+    def test_backward_branches_use_negative_displacement(self):
+        for mnemonic, golden in (("jmp", "E9 F4 FF FF FF"), ("je", "0F 84 F3 FF FF FF"),
+                                  ("jne", "0F 85 F3 FF FF FF")):
+            with self.subTest(mnemonic=mnemonic):
+                source = f"_start: xor rax, rax\ntarget: add rdi, 1\n{mnemonic} target"
+                result = assemble(parse(source, "a.asm"), 0x401000)
+                self.assertEqual(result.symbols["target"], 0x401003)
+                self.assertEqual(result.items[-1].address, 0x40100A)
+                self.assertEqual(result.items[-1].data, bytes.fromhex(golden))
+
+    def test_zero_displacement_to_next_instruction(self):
+        for mnemonic, opcode in (("jmp", "E9"), ("je", "0F 84"), ("jne", "0F 85")):
+            with self.subTest(mnemonic=mnemonic):
+                result = assemble(parse(f"_start: {mnemonic} next\nnext: syscall", "a.asm"), 0x401000)
+                self.assertEqual(result.items[0].data, bytes.fromhex(opcode + " 00 00 00 00"))
+
+    def test_branch_to_self_is_valid_boundary(self):
+        for mnemonic, golden in (("jmp", "E9 FB FF FF FF"), ("je", "0F 84 FA FF FF FF"),
+                                  ("jne", "0F 85 FA FF FF FF")):
+            with self.subTest(mnemonic=mnemonic):
+                result = assemble(parse(f"_start: {mnemonic} _start", "a.asm"), 0x401000)
+                self.assertEqual(result.code, bytes.fromhex(golden))
+
+    def test_branch_undefined_and_case_mismatched_labels(self):
+        for mnemonic in ("jmp", "je", "jne"):
+            for suffix in ("", "\ntarget: syscall"):
+                with self.subTest(mnemonic=mnemonic, suffix=suffix):
+                    program = parse(f"_start: {mnemonic} Target" + suffix, "a.asm")
+                    with self.assertRaises(ByteForgeError) as caught:
+                        assemble(program, 0x401000)
+                    self.assertIn("Undefined symbol: Target", caught.exception.message)
+                    self.assertEqual(caught.exception.location, program.statements[1].operands[0].location)
+
+    def test_branches_to_data_empty_data_and_trailing_labels_rejected(self):
+        for mnemonic in ("jmp", "je", "jne"):
+            for suffix in ('target: db "x"', 'target: db ""', "target:"):
+                with self.subTest(mnemonic=mnemonic, suffix=suffix):
+                    program = parse(f"_start: {mnemonic} target\nsyscall\n" + suffix, "a.asm")
+                    with patch("byteforge.resolver.encode") as encoder:
+                        with self.assertRaises(ByteForgeError) as caught:
+                            assemble(program, 0x401000)
+                        encoder.assert_not_called()
+                    self.assertIn("instruction boundary", caught.exception.message)
+                    self.assertEqual(caught.exception.location, program.statements[1].operands[0].location)
+
+    def test_boundary_validator_rejects_inside_instruction_address(self):
+        target = SymbolReference("middle", SourceLocation("a.asm", 1, 5, "jmp middle"))
+        with self.assertRaises(ByteForgeError) as caught:
+            _validate_branch_target(target, {"middle": 0x401001}, {0x401000, 0x40100A})
+        self.assertEqual(caught.exception.location, target.location)
+        self.assertIn("instruction boundary", caught.exception.message)
+
+    def test_multiple_code_labels_can_alias_one_instruction(self):
+        source = "_start: jmp first\nje second\njne third\nfirst:\nsecond:\nthird: syscall"
+        result = assemble(parse(source, "a.asm"), 0x401000)
+        for name in ("first", "second", "third"):
+            self.assertEqual(result.symbols[name], 0x401011)
+        self.assertEqual(result.items[0].data, bytes.fromhex("E9 0C 00 00 00"))
+        self.assertEqual(result.items[1].data, bytes.fromhex("0F 84 06 00 00 00"))
+        self.assertEqual(result.items[2].data, bytes.fromhex("0F 85 00 00 00 00"))
+
+    def test_mixed_sizes_and_entry_offset_remain_stable(self):
+        source = ("xor rdi, rdi\n_start: jmp target\nadd rax, 1\nmov rdi, 0\n"
+                  "cmp rax, 0\ntarget: syscall")
+        result = assemble(parse(source, "a.asm"), 0x401000)
+        self.assertEqual(result.symbols["_start"], 0x401003)
+        self.assertEqual(result.symbols["target"], 0x401020)
+        self.assertEqual([item.address for item in result.items],
+                         [0x401000, 0x401003, 0x401008, 0x40100F, 0x401019, 0x401020])
+        self.assertEqual(result.items[1].data, bytes.fromhex("E9 18 00 00 00"))
+
+    def test_symbolic_mov_still_accepts_data_with_branches(self):
+        source = '_start: mov rsi, msg\njmp done\ndone: syscall\nmsg: db "x"'
+        result = assemble(parse(source, "a.asm"), 0x401000)
+        self.assertEqual(result.symbols["msg"], 0x401011)
+        self.assertEqual(result.items[0].data, bytes.fromhex("48 BE 11 10 40 00 00 00 00 00"))
+        self.assertEqual(result.items[1].data, bytes.fromhex("E9 00 00 00 00"))
+        self.assertEqual(result.data, b"x")
+
+    def test_branch_duplicate_labels_and_data_restriction(self):
+        with self.assertRaisesRegex(ByteForgeError, "Duplicate label: target"):
+            assemble(parse("_start: jmp target\ntarget: syscall\ntarget:", "a.asm"), 0x401000)
+        for mnemonic in ("jmp", "je", "jne"):
+            with self.subTest(mnemonic=mnemonic):
+                with self.assertRaisesRegex(ByteForgeError, "cannot follow a DB"):
+                    assemble(parse(f'_start: syscall\ndb ""\n{mnemonic} _start', "a.asm"), 0x401000)
+
+    def test_branch_size_mismatch_is_detected(self):
+        program = parse("_start: jmp _start", "a.asm")
+        with patch("byteforge.resolver.encode", return_value=b"\xe9\x00"):
+            with self.assertRaisesRegex(ByteForgeError, "size mismatch"):
+                assemble(program, 0x401000)
+
+    def test_branch_assembly_is_deterministic(self):
+        program = parse("_start: jmp done\nxor rax, rax\ndone: syscall", "a.asm")
+        before = repr(program)
+        self.assertEqual(assemble(program, 0x401000), assemble(program, 0x401000))
+        self.assertEqual(repr(program), before)
+
+    def test_missing_branch_operand_is_rejected_by_encoder_contract(self):
+        program = parse("_start: syscall", "a.asm")
+        program.statements[1] = replace(program.statements[1], mnemonic="jmp")
+        with self.assertRaisesRegex(ByteForgeError, "requires 1 operands"):
             assemble(program, 0x401000)
 
     def test_immediate_error_is_preserved(self):

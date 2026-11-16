@@ -1,4 +1,4 @@
-"""Handwritten MOV, fixed-imm32 arithmetic, register XOR and SYSCALL encodings."""
+"""Handwritten base-register instructions and fixed-width relative branches."""
 
 from collections.abc import Mapping
 import struct
@@ -20,8 +20,12 @@ _FORM_SIZES = {
     ("sub", (Register, Immediate)): 7,
     ("cmp", (Register, Immediate)): 7,
     ("xor", (Register, Register)): 3,
+    ("jmp", (SymbolReference,)): 5,
+    ("je", (SymbolReference,)): 6,
+    ("jne", (SymbolReference,)): 6,
 }
 _GROUP1_EXTENSIONS = {"add": 0, "sub": 5, "cmp": 7}
+_BRANCH_OPCODES = {"jmp": b"\xe9", "je": b"\x0f\x84", "jne": b"\x0f\x85"}
 _MIN_IMM64 = -(1 << 63)
 _MAX_IMM64 = (1 << 64) - 1
 
@@ -72,7 +76,7 @@ def _modrm_register(reg_code: int, rm_code: int) -> bytes:
 def _validate(instruction: Instruction) -> int:
     """Share form, register and range checks between sizing and emission."""
     mnemonic = instruction.mnemonic
-    if mnemonic not in ("mov", "syscall", "add", "sub", "cmp", "xor"):
+    if mnemonic not in ("mov", "syscall", "add", "sub", "cmp", "xor", "jmp", "je", "jne"):
         raise ByteForgeError(instruction.location, f"Unsupported instruction: {mnemonic}")
     if mnemonic == "mov":
         expected = (Register, (Immediate, SymbolReference))
@@ -83,6 +87,9 @@ def _validate(instruction: Instruction) -> int:
     elif mnemonic == "xor":
         expected = (Register, Register)
         form_message = "XOR requires two register operands"
+    elif mnemonic in _BRANCH_OPCODES:
+        expected = (SymbolReference,)
+        form_message = f"{mnemonic.upper()} requires a label reference"
     else:
         expected = ()
         form_message = "SYSCALL requires no operands"
@@ -94,6 +101,8 @@ def _validate(instruction: Instruction) -> int:
     for operand, kind in zip(instruction.operands, expected):
         if not isinstance(operand, kind):
             raise ByteForgeError(operand.location, form_message)
+    if mnemonic in _BRANCH_OPCODES:
+        return _FORM_SIZES[(mnemonic, (SymbolReference,))]
     if mnemonic in _GROUP1_EXTENSIONS:
         destination, source = instruction.operands
         _base_register_code(destination)
@@ -128,15 +137,33 @@ def encoded_size(instruction: Instruction) -> int:
     return _validate(instruction)
 
 
+def _rel32(target: int, address: int, size: int, location: SourceLocation) -> bytes:
+    if (type(address) is not int or not 0 <= address <= _MAX_IMM64
+            or address + size > (1 << 64)):
+        raise ByteForgeError(location, "Branch instruction address exceeds the 64-bit address range")
+    displacement = target - (address + size)
+    if not -(1 << 31) <= displacement < (1 << 31):
+        raise ByteForgeError(location, "Branch displacement must be in signed rel32 range")
+    return struct.pack("<i", displacement)
+
+
 def encode(
     instruction: Instruction, address: int, symbols: Mapping[str, int]
 ) -> bytes:
-    """Encode one instruction using final absolute symbol addresses.
+    """Encode one instruction using final virtual addresses.
 
-    The instruction address is reserved for future relative branch forms.
+    Branch displacements use the address after the instruction. The resolver
+    validates instruction-boundary targets; this API receives addresses only.
     No file I/O or printing occurs.
     """
-    _validate(instruction)
+    size = _validate(instruction)
+    if instruction.mnemonic in _BRANCH_OPCODES:
+        source = instruction.operands[0]
+        target = _symbol_address(source, symbols)
+        data = _BRANCH_OPCODES[instruction.mnemonic] + _rel32(target, address, size, source.location)
+        if len(data) != size:
+            raise ByteForgeError(instruction.location, "Encoder branch size mismatch")
+        return data
     if instruction.mnemonic == "syscall":
         return b"\x0f\x05"
     destination, source = instruction.operands

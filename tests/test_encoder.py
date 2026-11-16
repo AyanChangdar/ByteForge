@@ -100,10 +100,118 @@ class EncoderTests(unittest.TestCase):
 
     def test_unsupported_mnemonics(self):
         instruction = self.instruction("mov rax, 1")
-        for mnemonic in ("jmp", "je", "jne", "nop"):
+        for mnemonic in ("call", "loop", "nop"):
             with self.subTest(mnemonic=mnemonic):
                 self.assert_rejected(replace(instruction, mnemonic=mnemonic),
                                      instruction.location, "Unsupported instruction")
+
+    def test_branch_documented_golden_bytes(self):
+        for mnemonic, expected in (("jmp", "E9 0B 00 00 00"),
+                                   ("je", "0F 84 0A 00 00 00"),
+                                   ("jne", "0F 85 0A 00 00 00")):
+            with self.subTest(mnemonic=mnemonic):
+                instruction = self.instruction(f"{mnemonic} Target")
+                data = encode(instruction, 0x401000, {"Target": 0x401010})
+                self.assertEqual(data, bytes.fromhex(expected))
+                self.assertEqual(encoded_size(instruction), len(data))
+
+    def test_unresolved_branch_sizes_are_fixed(self):
+        for mnemonic, size in (("jmp", 5), ("je", 6), ("jne", 6)):
+            with self.subTest(mnemonic=mnemonic):
+                self.assertEqual(encoded_size(self.instruction(f"{mnemonic} undefined")), size)
+
+    def test_branch_positive_negative_zero_and_next_instruction_origin(self):
+        for mnemonic, opcode, size in (("jmp", "E9", 5), ("je", "0F 84", 6), ("jne", "0F 85", 6)):
+            for displacement, golden in ((0, "00 00 00 00"), (1, "01 00 00 00"),
+                                          (-1, "FF FF FF FF"), (-20, "EC FF FF FF"),
+                                          (0x12345678, "78 56 34 12")):
+                with self.subTest(mnemonic=mnemonic, displacement=displacement):
+                    instruction = self.instruction(f"{mnemonic} target")
+                    target = 0x401000 + size + displacement
+                    self.assertEqual(encode(instruction, 0x401000, {"target": target}),
+                                     bytes.fromhex(opcode + " " + golden))
+
+    def test_branch_signed_rel32_boundaries(self):
+        address = 0x90000000
+        for mnemonic, opcode, size in (("jmp", "E9", 5), ("je", "0F 84", 6), ("jne", "0F 85", 6)):
+            for displacement, golden in ((-(1 << 31), "00 00 00 80"),
+                                          ((1 << 31) - 1, "FF FF FF 7F")):
+                with self.subTest(mnemonic=mnemonic, displacement=displacement):
+                    instruction = self.instruction(f"{mnemonic} target")
+                    data = encode(instruction, address, {"target": address + size + displacement})
+                    self.assertEqual(data, bytes.fromhex(opcode + " " + golden))
+                    self.assertEqual(len(data), encoded_size(instruction))
+
+    def test_branch_rel32_overflow_and_underflow(self):
+        address = 0x90000000
+        for mnemonic, size in (("jmp", 5), ("je", 6), ("jne", 6)):
+            for displacement in (-(1 << 31) - 1, 1 << 31):
+                with self.subTest(mnemonic=mnemonic, displacement=displacement):
+                    instruction = self.instruction(f"{mnemonic} target")
+                    with self.assertRaises(ByteForgeError) as caught:
+                        encode(instruction, address, {"target": address + size + displacement})
+                    self.assertEqual(caught.exception.location, instruction.operands[0].location)
+                    self.assertIn("signed rel32", caught.exception.message)
+
+    def test_branch_undefined_and_case_mismatched_symbols(self):
+        for mnemonic in ("jmp", "je", "jne"):
+            for symbols in ({}, {"target": 0x401010}):
+                with self.subTest(mnemonic=mnemonic, symbols=symbols):
+                    instruction = self.instruction(f"{mnemonic} Target")
+                    with self.assertRaises(ByteForgeError) as caught:
+                        encode(instruction, 0x401000, symbols)
+                    self.assertIn("Undefined symbol: Target", caught.exception.message)
+                    self.assertEqual(caught.exception.location, instruction.operands[0].location)
+
+    def test_branch_invalid_target_addresses(self):
+        for mnemonic in ("jmp", "je", "jne"):
+            instruction = self.instruction(f"{mnemonic} target")
+            for target in (-1, 1 << 64, True, 1.5, "10", None):
+                with self.subTest(mnemonic=mnemonic, target=target):
+                    with self.assertRaises(ByteForgeError) as caught:
+                        encode(instruction, 0x401000, {"target": target})
+                    self.assertEqual(caught.exception.location, instruction.operands[0].location)
+                    self.assertIn("unsigned 64-bit", caught.exception.message)
+
+    def test_branch_invalid_instruction_addresses(self):
+        instruction = self.instruction("jmp target")
+        for address in (-1, 1 << 64, (1 << 64) - 1, True, 1.0):
+            with self.subTest(address=address):
+                with self.assertRaisesRegex(ByteForgeError, "instruction address"):
+                    encode(instruction, address, {"target": 0x401000})
+
+    def test_branch_operand_types_and_counts(self):
+        for mnemonic in ("jmp", "je", "jne"):
+            instruction = self.instruction(f"{mnemonic} target")
+            for operands in ((), instruction.operands * 2):
+                with self.subTest(mnemonic=mnemonic, count=len(operands)):
+                    self.assert_rejected(replace(instruction, operands=operands),
+                                         instruction.location, "requires 1 operands")
+            location = instruction.operands[0].location
+            for operand in (Immediate(1, location), Register("rax", 0, 64, location)):
+                with self.subTest(mnemonic=mnemonic, operand=operand):
+                    self.assert_rejected(replace(instruction, operands=(operand,)), location, "label reference")
+
+    def test_branch_diagnostic_preserves_source(self):
+        line = "\tJNE Missing ; keep original  "
+        instruction = parse("; first\n" + line, "branch.asm").statements[0]
+        with self.assertRaises(ByteForgeError) as caught:
+            encode(instruction, 0x401000, {})
+        self.assertEqual(caught.exception.location, SourceLocation("branch.asm", 2, 6, line))
+
+    def test_branch_determinism_no_mutation_or_io(self):
+        instruction = self.instruction("jne target")
+        before = repr(instruction)
+        symbols = {"target": 0x401000}
+        with patch("builtins.open") as files, patch("sys.stdout") as stdout, patch("sys.stderr") as stderr:
+            first = encode(instruction, 0x401014, symbols)
+            self.assertEqual(first, encode(instruction, 0x401014, symbols))
+            self.assertIs(type(first), bytes)
+            files.assert_not_called()
+            stdout.write.assert_not_called()
+            stderr.write.assert_not_called()
+        self.assertEqual(symbols, {"target": 0x401000})
+        self.assertEqual(repr(instruction), before)
 
     def test_arithmetic_documented_golden_bytes(self):
         for source, expected in (

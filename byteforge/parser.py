@@ -117,13 +117,22 @@ def _register(token: _Token, message: str) -> Register:
 
 def _instruction(head: _Token, operands: list[_Token], end: SourceLocation) -> Instruction:
     mnemonic = head.text.lower()
-    expected = 0 if mnemonic == "syscall" else 2
+    is_branch = mnemonic in ("jmp", "je", "jne")
+    expected = 1 if is_branch else (0 if mnemonic == "syscall" else 2)
     if len(operands) < expected:
-        raise ByteForgeError(end, f"{mnemonic.upper()} requires two operands")
+        message = "one label operand" if is_branch else "two operands"
+        raise ByteForgeError(end, f"{mnemonic.upper()} requires {message}")
     if len(operands) > expected:
         raise ByteForgeError(operands[expected].location, f"Extra operand for {mnemonic.upper()}")
     if mnemonic == "syscall":
         return Instruction(mnemonic, (), head.location)
+    if is_branch:
+        target = operands[0]
+        if target.data is not None or not _IDENTIFIER.fullmatch(target.text):
+            raise ByteForgeError(target.location, "Branch target must be a label identifier")
+        if target.text.lower() in _REGISTER_CODES or target.text.lower() in _UNSUPPORTED_REGISTERS:
+            raise ByteForgeError(target.location, "Register branch targets are not supported")
+        return Instruction(mnemonic, (SymbolReference(target.text, target.location),), head.location)
     destination, source = operands
     register = _register(destination, f"{mnemonic.upper()} destination must be a supported 64-bit register")
     if mnemonic in ("add", "sub", "cmp"):
@@ -168,7 +177,9 @@ def parse(source: str, filename: str) -> Program:
                 raise ByteForgeError(token.location, "Malformed label or multiple labels on one line")
         head = tokens[0]
         mnemonic = head.text.lower()
-        if head.data is not None or mnemonic not in ("mov", "syscall", "add", "sub", "cmp", "xor", "db"):
+        if head.data is not None or mnemonic not in (
+            "mov", "syscall", "add", "sub", "cmp", "xor", "jmp", "je", "jne", "db"
+        ):
             raise ByteForgeError(head.location, f"Unknown instruction: {head.text}")
         # Missing input is indicated immediately after the last syntactic token,
         # before any trailing whitespace or comment.

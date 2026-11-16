@@ -144,9 +144,50 @@ class ParserTests(unittest.TestCase):
                                  SourceLocation("a.asm", 2, 3, "  syscall"))
 
     def test_unknown_instructions(self):
-        for source in ("nop", "jmp loop", "je loop", "jne loop"):
+        for source in ("nop", "call target", "loop target"):
             with self.subTest(source=source):
                 self.assert_invalid(source, "Unknown instruction", 1)
+
+    def test_branches_preserve_unresolved_case_sensitive_labels(self):
+        for mnemonic in ("jmp", "je", "jne"):
+            with self.subTest(mnemonic=mnemonic):
+                instruction = self.instruction(f"{mnemonic.upper()} Target")
+                self.assertEqual(instruction.mnemonic, mnemonic)
+                self.assertEqual(len(instruction.operands), 1)
+                self.assertIsInstance(instruction.operands[0], SymbolReference)
+                self.assertEqual(instruction.operands[0].name, "Target")
+
+    def test_branch_source_locations_preserve_original_line(self):
+        line = "\tJnE Loop ; original spacing  "
+        instruction = parse("_start:\n" + line, "branch.asm").statements[1]
+        self.assertEqual(instruction.location, SourceLocation("branch.asm", 2, 2, line))
+        self.assertEqual(instruction.operands[0].location, SourceLocation("branch.asm", 2, 6, line))
+        self.assertEqual(instruction.operands[0].name, "Loop")
+
+    def test_branches_reject_numeric_string_and_memory_targets(self):
+        for mnemonic in ("jmp", "je", "jne"):
+            for target in ("1", "-1", "0x401000", '"target"', "[rax]", "bad-name", ".local"):
+                with self.subTest(mnemonic=mnemonic, target=target):
+                    self.assert_invalid(f"{mnemonic} {target}", "label identifier", len(mnemonic) + 2)
+
+    def test_branches_reject_register_targets(self):
+        for mnemonic in ("jmp", "je", "jne"):
+            for target in ("rax", "RDI", "eax", "r8", "r15d", "rip"):
+                with self.subTest(mnemonic=mnemonic, target=target):
+                    self.assert_invalid(f"{mnemonic} {target}", "Register branch targets", len(mnemonic) + 2)
+
+    def test_branch_operand_counts_and_separators(self):
+        for mnemonic in ("jmp", "je", "jne"):
+            with self.subTest(mnemonic=mnemonic):
+                self.assert_invalid(mnemonic, "one label operand", len(mnemonic) + 1)
+                self.assert_invalid(f"{mnemonic} target, extra", "Extra operand", len(mnemonic) + 10)
+                self.assert_invalid(f"{mnemonic} target extra", "Expected comma", len(mnemonic) + 9)
+                self.assert_invalid(f"{mnemonic} target,", "Missing operand", len(mnemonic) + 9)
+                self.assert_invalid(f"{mnemonic} ,target", "Missing operand", len(mnemonic) + 2)
+
+    def test_branch_accepts_ordinary_identifier_resembling_register(self):
+        instruction = self.instruction("jmp rax_handler")
+        self.assertEqual(instruction.operands[0].name, "rax_handler")
 
     def test_arithmetic_register_and_immediate_operands(self):
         for mnemonic in ("add", "sub", "cmp"):
