@@ -118,13 +118,59 @@ class EncoderTests(unittest.TestCase):
         self.assert_rejected(replace(instruction, operands=(immediate,)),
                              instruction.location, "requires 0 operands")
 
-    def test_symbolic_mov_is_rejected(self):
+    def test_symbolic_mov_uses_resolved_address(self):
         instruction = self.instruction("mov rsi, Message")
         self.assertIsInstance(instruction.operands[1], SymbolReference)
-        self.assert_rejected(instruction, instruction.operands[1].location, "integer immediate")
+        self.assertEqual(encoded_size(instruction), 10)
+        self.assertEqual(encode(instruction, 0x401000, {"Message": 0x401040}),
+                         bytes.fromhex("48 BE 40 10 40 00 00 00 00 00"))
+
+    def test_undefined_symbol_reports_operand_location(self):
+        instruction = self.instruction("mov rsi, Message")
+        self.assertEqual(encoded_size(instruction), 10)
         with self.assertRaises(ByteForgeError) as caught:
-            encode(instruction, 0x401000, {"Message": 0x402000})
+            encode(instruction, 0x401000, {})
         self.assertEqual(caught.exception.location, instruction.operands[1].location)
+        self.assertIn("Undefined symbol: Message", caught.exception.message)
+
+    def test_symbol_names_are_case_sensitive(self):
+        instruction = self.instruction("mov rsi, Message")
+        with self.assertRaisesRegex(ByteForgeError, "Undefined symbol: Message"):
+            encode(instruction, 0, {"message": 0x401040})
+
+    def test_invalid_symbol_addresses(self):
+        instruction = self.instruction("mov rsi, Message")
+        for value in (-1, 1 << 64, True, None, 1.5, "0x401040"):
+            with self.subTest(value=value):
+                with self.assertRaises(ByteForgeError) as caught:
+                    encode(instruction, 0, {"Message": value})
+                self.assertEqual(caught.exception.location, instruction.operands[1].location)
+                self.assertIn("unsigned 64-bit", caught.exception.message)
+
+    def test_symbol_address_boundaries(self):
+        instruction = self.instruction("mov rax, symbol")
+        for address, expected in ((0, "00 00 00 00 00 00 00 00"),
+                                  ((1 << 64) - 1, "FF FF FF FF FF FF FF FF")):
+            with self.subTest(address=address):
+                self.assertEqual(encode(instruction, 0, {"symbol": address}),
+                                 bytes.fromhex("48 B8 " + expected))
+
+    def test_symbolic_golden_bytes_all_base_registers(self):
+        for name, opcode in (("rax", "B8"), ("rcx", "B9"), ("rdx", "BA"), ("rbx", "BB"),
+                             ("rsp", "BC"), ("rbp", "BD"), ("rsi", "BE"), ("rdi", "BF")):
+            with self.subTest(register=name):
+                instruction = self.instruction(f"mov {name}, msg")
+                data = encode(instruction, 0, {"msg": 0x0123456789ABCDEF})
+                self.assertEqual(data, bytes.fromhex(f"48 {opcode} EF CD AB 89 67 45 23 01"))
+                self.assertEqual(encoded_size(instruction), len(data))
+
+    def test_symbolic_output_is_deterministic_and_does_not_mutate_inputs(self):
+        instruction = self.instruction("mov rsi, msg")
+        before = repr(instruction)
+        symbols = {"msg": 0x401040}
+        self.assertEqual(encode(instruction, 0, symbols), encode(instruction, 100, symbols))
+        self.assertEqual(symbols, {"msg": 0x401040})
+        self.assertEqual(repr(instruction), before)
 
     def test_register_to_register_mov_is_rejected(self):
         instruction = self.instruction("mov rax, 1")

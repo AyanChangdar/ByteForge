@@ -69,21 +69,91 @@ class ResolverTests(unittest.TestCase):
                 self.assertIn("end of code", caught.exception.message)
                 self.assertEqual(caught.exception.location, program.statements[-1].location)
 
-    def test_db_is_rejected_even_when_empty(self):
-        for text in ('db "hello"', 'db ""', 'db 0'):
+    def test_db_bytes_are_collected_including_empty_strings(self):
+        for text, expected in (('db "hello"', b"hello"), ('db ""', b""), ('db 0', b"\x00")):
             with self.subTest(text=text):
                 program = parse("_start: syscall\n" + text, "data.asm")
-                with self.assertRaises(ByteForgeError) as caught:
-                    assemble(program, 0x401000)
-                self.assertIn("DB directives", caught.exception.message)
-                self.assertEqual(caught.exception.location, program.statements[-1].location)
+                result = assemble(program, 0x401000)
+                self.assertEqual(result.code, b"\x0f\x05")
+                self.assertEqual(result.data, expected)
 
-    def test_symbolic_mov_is_rejected_with_operand_location(self):
+    def test_forward_code_label_reference(self):
         program = parse("_start: mov rsi, target\ntarget: syscall", "a.asm")
+        result = assemble(program, 0x401000)
+        self.assertEqual(result.symbols["target"], 0x40100A)
+        self.assertEqual(result.code[:10], bytes.fromhex("48 BE 0A 10 40 00 00 00 00 00"))
+        self.assertEqual(result.items[0].resolution, {"target": 0x40100A})
+
+    def test_undefined_symbol_has_operand_location(self):
+        program = parse("_start: mov rsi, missing", "a.asm")
         with self.assertRaises(ByteForgeError) as caught:
             assemble(program, 0x401000)
         self.assertEqual(caught.exception.location, program.statements[1].operands[1].location)
-        self.assertIn("integer immediate", caught.exception.message)
+        self.assertIn("Undefined symbol: missing", caught.exception.message)
+
+    def test_forward_data_reference_and_separate_label(self):
+        program = parse('_start: mov rsi, msg\nsyscall\nmsg:\ndb "Hi", 10', "a.asm")
+        result = assemble(program, 0x401000)
+        self.assertEqual(len(result.code), 12)
+        self.assertEqual(result.data, b"Hi\n")
+        self.assertEqual(result.symbols, {"_start": 0x401000, "msg": 0x40100C})
+        self.assertEqual(result.code[:10], bytes.fromhex("48 BE 0C 10 40 00 00 00 00 00"))
+        self.assertEqual(result.items[0].resolution, {"msg": 0x40100C})
+
+    def test_multiple_data_directives_and_aliases(self):
+        source = '_start: syscall\nfirst:\nalias: db "AB"\nempty: db ""\nsecond: db 0, 255\nend:'
+        result = assemble(parse(source, "data.asm"), 100)
+        self.assertEqual(result.data, b"AB\x00\xff")
+        self.assertEqual(result.symbols, {"_start": 100, "first": 102, "alias": 102,
+                                         "empty": 104, "second": 104, "end": 106})
+
+    def test_instructions_after_data_are_rejected_even_after_empty_db(self):
+        for directive in ('db "x"', 'db ""'):
+            with self.subTest(directive=directive):
+                program = parse(f"_start: syscall\n{directive}\nmov rax, 60", "a.asm")
+                with self.assertRaises(ByteForgeError) as caught:
+                    assemble(program, 0x401000)
+                self.assertIn("cannot follow a DB", caught.exception.message)
+                self.assertEqual(caught.exception.location, program.statements[-1].location)
+
+    def test_data_before_instruction_region_is_rejected(self):
+        program = parse('db "x"\n_start: syscall', "a.asm")
+        with self.assertRaisesRegex(ByteForgeError, "cannot follow a DB"):
+            assemble(program, 0x401000)
+
+    def test_start_in_data_is_rejected(self):
+        program = parse('syscall\n_start: db "x"', "a.asm")
+        with self.assertRaises(ByteForgeError) as caught:
+            assemble(program, 0x401000)
+        self.assertEqual(caught.exception.location, program.statements[1].location)
+        self.assertIn("must identify an instruction", caught.exception.message)
+
+    def test_duplicate_symbols_across_code_and_data(self):
+        for source in ('_start: syscall\n_start: db "x"',
+                       '_start: syscall\nmsg: db "x"\nmsg: db "y"'):
+            with self.subTest(source=source):
+                program = parse(source, "a.asm")
+                with self.assertRaisesRegex(ByteForgeError, "Duplicate label"):
+                    assemble(program, 0x401000)
+
+    def test_data_symbol_names_are_case_sensitive(self):
+        result = assemble(parse('_start: syscall\nmsg: db 1\nMsg: db 2', "a.asm"), 100)
+        self.assertEqual(result.symbols["msg"], 102)
+        self.assertEqual(result.symbols["Msg"], 103)
+        with self.assertRaisesRegex(ByteForgeError, "Undefined symbol: MSG"):
+            assemble(parse('_start: mov rsi, MSG\nmsg: db 1', "a.asm"), 100)
+
+    def test_data_overflow_and_one_past_end_label(self):
+        for source in ('_start: syscall\ndb "AB"', '_start: syscall\nend:'):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(ByteForgeError, "64-bit address range"):
+                    assemble(parse(source, "a.asm"), (1 << 64) - 2)
+
+    def test_data_assembly_is_deterministic(self):
+        program = parse('_start: mov rsi, msg\nsyscall\nmsg: db "x"', "a.asm")
+        before = repr(program)
+        self.assertEqual(assemble(program, 100), assemble(program, 100))
+        self.assertEqual(repr(program), before)
 
     def test_unsupported_instruction_is_rejected(self):
         program = parse("_start: syscall", "a.asm")

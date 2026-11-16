@@ -97,12 +97,56 @@ class ElfTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "payload"):
             build_executable(replace(self.result, code=b"\x00"), self.config)
 
-    def test_data_and_empty_code_rejected(self):
-        for result in (replace(self.result, data=b"x"), replace(self.result, code=b""),
-                       replace(self.result, items=[])):
+    def test_data_is_appended_after_code(self):
+        image, layout = build_executable(replace(self.result, data=b"x"), self.config)
+        self.assertEqual(image[0x1000:], self.result.code + b"x")
+        self.assertEqual(layout.file_size, 4119)
+        self.assertEqual(struct.unpack_from("<QQ", image, 96), (4119, 4119))
+
+    def test_empty_code_rejected_even_with_data(self):
+        for result in (replace(self.result, code=b""), replace(self.result, items=[]),
+                       replace(self.result, code=b"", items=[], data=b"x")):
             with self.subTest(result=result):
                 with self.assertRaises(ValueError):
                     build_executable(result, self.config)
+
+    def test_hello_world_layout_and_symbol_bytes(self):
+        source = ('_start:\nmov rax, 1\nmov rdi, 1\nmov rsi, msg\nmov rdx, 14\nsyscall\n'
+                  'mov rax, 60\nmov rdi, 0\nsyscall\nmsg: db "Hello, World!", 10')
+        result = assemble(parse(source, "hello.asm"), 0x401000)
+        image, layout = build_executable(result, self.config)
+        header = struct.unpack_from("<16sHHIQQQIHHHHHH", image)
+        segment = struct.unpack_from("<IIQQQQQQ", image, 64)
+        self.assertEqual(len(result.code), 64)
+        self.assertEqual(result.data, b"Hello, World!\n")
+        self.assertEqual(result.symbols["msg"], 0x401040)
+        self.assertEqual(image[0x1040:], b"Hello, World!\n")
+        self.assertEqual(result.symbols["msg"] - 0x400000, 0x1040)
+        self.assertEqual(image[0x1014:0x101E], bytes.fromhex("48 BE 40 10 40 00 00 00 00 00"))
+        self.assertEqual(image[0x1000:0x1040], bytes.fromhex(
+            "48 B8 01 00 00 00 00 00 00 00 48 BF 01 00 00 00 00 00 00 00 "
+            "48 BE 40 10 40 00 00 00 00 00 48 BA 0E 00 00 00 00 00 00 00 "
+            "0F 05 48 B8 3C 00 00 00 00 00 00 00 48 BF 00 00 00 00 00 00 00 00 0F 05"
+        ))
+        self.assertEqual(header[1:4], (2, 62, 1))
+        self.assertEqual(header[4], 0x401000)
+        self.assertEqual(segment, (1, 5, 0, 0x400000, 0x400000, 4174, 4174, 0x1000))
+        self.assertEqual(len(image), 4174)
+        self.assertEqual(layout.file_size, 4174)
+        self.assertEqual(build_executable(result, self.config), (image, layout))
+
+    def test_empty_data_does_not_change_exit_binary(self):
+        source = '_start:\nmov rax, 60\nmov rdi, 7\nsyscall\nempty: db ""'
+        result = assemble(parse(source, "a.asm"), 0x401000)
+        image, layout = build_executable(result, self.config)
+        self.assertEqual(result.data, b"")
+        self.assertEqual(image, self.image)
+        self.assertEqual(layout, self.layout)
+
+    def test_entry_in_data_is_rejected_by_writer(self):
+        result = replace(self.result, data=b"x", symbols={"_start": 0x401016})
+        with self.assertRaisesRegex(ValueError, "inside the code"):
+            build_executable(result, self.config)
 
     def test_invalid_configurations(self):
         configurations = (

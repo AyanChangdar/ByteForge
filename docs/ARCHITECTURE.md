@@ -48,9 +48,9 @@ ByteForge/
 `-- build/                 # ignored generated artifacts
 ```
 
-Milestone 4 implements the model, parser, encoder, resolver, ELF writer, CLI,
-exit example and their tests. Reports, visualization and the other examples
-remain planned.
+Milestone 5A implements the model, parser, MOV-immediate/symbol encoder,
+two-pass resolver, ELF writer, CLI, exit/Hello World examples and their tests.
+Arithmetic, branches, reports and visualization remain planned.
 
 ## 3. Shared data model and interfaces
 
@@ -93,10 +93,12 @@ ElfSegment(p_type: int, p_flags: int, p_offset: int, p_vaddr: int,
 ElfLayout(entry: int, segments: list[ElfSegment], file_size: int)
 ```
 
-Each encoded item retains its original instruction and location. Resolution
-metadata defaults to an independently allocated empty dictionary in this
-milestone; `AssemblyResult.data` is empty. Frozen result objects contain ordinary
-mutable collections, which callers should treat as read-only. ElfConfig names
+Each encoded item retains its original instruction and location. Symbolic MOV
+records `{symbol_name: absolute_address}` in its resolution metadata; numeric
+instructions retain an empty dictionary. Items describe instructions only.
+`AssemblyResult.data` holds concatenated DB bytes separately from code.
+Frozen result objects contain ordinary mutable collections, which callers
+should treat as read-only. ElfConfig names
 the fixed layout; the writer rejects configurations other than approved defaults.
 
 The implemented diagnostic contract is `SourceLocation` and
@@ -193,37 +195,47 @@ addresses, instruction sizes or machine code are calculated by the parser.
 
 ### Stage 2: Layout and collect symbols
 
-The resolver performs pass 1 over the parsed program. It asks the existing
-encoder for each instruction's exact size and collects labels at the current
-instruction address. `base_address` means the virtual address of the first
-code byte, not the ELF image base. DB directives (including empty ones),
-symbolic MOV and unsupported instructions are rejected. Every duplicate label
-is an error at the second definition. `_start` is case-sensitive, required,
-and must identify an instruction boundary; an entry at end-of-code is rejected.
+The resolver performs pass 1 over the parsed program. It asks the encoder for
+each instruction's exact size, records instruction addresses and collects
+labels at the current address cursor. `base_address` means the virtual address
+of the first code byte, not the ELF image base. The first DB starts the data
+region, even for `db ""`. Every later instruction is rejected at its source
+location; code/data interleaving is never reordered. DB bytes advance the
+cursor by their exact length, without padding or an implicit terminator.
+Every duplicate label is an error at the second definition. `_start` remains
+case-sensitive, required, and must identify a code instruction boundary;
+an entry in data or at end-of-code is rejected.
 
 Symbol values are virtual addresses. The CLI passes
 `ElfConfig.image_base + ElfConfig.code_offset` as the code base:
 
 ```text
-symbol address = image base + code file offset + instruction offset
+code base = image base + code file offset
+code symbol address = code base + instruction offset
+data symbol address = code base + total code size + data offset
 ```
 
 For a missing `_start`, the diagnostic uses the first statement's location.
 An empty program uses `filename:1:1` and empty source text; the CLI supplies
-the input filename through the optional keyword. Labels need no source
-references to be collected, but general symbol-reference encoding is deferred.
+the input filename through the optional keyword. Separate and consecutive
+labels bind to the same current cursor as inline labels. Trailing labels may
+mark one-past-end positions, but `_start` must identify an instruction. Code,
+data and label addresses are checked for 64-bit overflow. Bare `db` is still
+invalid syntax; empty data uses the existing `db ""` form.
 
 ### Stage 3: Encode and resolve references
 
 Pass 2 calls the existing `encode(instruction, address, symbols)` with the
 final addresses and label table. Every emitted length must match its planned
 size; a mismatch raises a source-located `ByteForgeError`. No file I/O or
-printing occurs. The encoder still rejects symbolic MOV even when the target
-is defined. `AssemblyResult.items` preserves code bytes and source metadata.
+printing occurs. Symbolic MOV looks up the case-sensitive symbol name and
+encodes its absolute address using the same ten-byte form as numeric MOV.
+Undefined symbols raise `ByteForgeError` at the symbol operand's location.
+`AssemblyResult.items` preserves code bytes and source/resolution metadata;
+`code` and `data` remain separate payloads.
 
-Future near branches will use `disp32 = target - address_after_instruction`,
-and symbolic MOV will encode the resolved address as imm64. Those features,
-including undefined-reference diagnostics, are not implemented in Milestone 4.
+Future near branches will use `disp32 = target - address_after_instruction`.
+Branching and symbol expressions remain unsupported.
 
 ### Stage 4: Build the ELF64 executable
 
@@ -241,6 +253,8 @@ header). The single PT_LOAD maps the entire file, including headers and padding.
 +------------------------+ code file offset 0x1000
 | encoded instructions   | entry points to _start
 +------------------------+
+| DB bytes               | immediately after code
++------------------------+
 ```
 
 The fixed image base is `0x400000`; code starts at virtual address `0x401000`.
@@ -254,7 +268,10 @@ The segment has `p_type=1`, `p_flags=5` (read/execute), `p_offset=0`,
 Virtual address and file offset are congruent modulo alignment. Padding from
 file offset 120 to 4096 is zero. `_start` supplies `e_entry`; it is not assumed
 to be the first instruction. The exit example has entry `0x401000`, 22 code
-bytes and a 4118-byte file. Data payloads are rejected.
+bytes and a 4118-byte file. The Hello World example has 64 code bytes followed
+by `b"Hello, World!\n"` (14 bytes): `msg=0x401040`, data file offset `0x1040`,
+and file/segment size 4174 bytes. Both examples enter at `0x401000`.
+File size is `code_offset + len(code) + len(data)`; memory size equals it.
 
 The writer validates struct sizes, the fixed layout/alignment, assembly item
 addresses, payload consistency, total length, 64-bit bounds and entry range
@@ -289,15 +306,15 @@ and an ELF layout diagram. It does not execute or emulate instructions.
 ## 5. Supported instruction forms
 
 Keep the encoding matrix explicit and small. The parser accepts
-`MOV r64, integer/symbol` and `SYSCALL`. Milestone 3 encodes only these forms:
+`MOV r64, integer/symbol` and `SYSCALL`. Milestone 5A encodes these forms:
 
 | Instruction | Operand form | Bytes | Size |
 |---|---|---|---|
 | `MOV` | base `r64, integer` | `48`, `B8 + register_code`, little-endian imm64 | 10 |
+| `MOV` | base `r64, symbol` | same form, with the resolved absolute virtual address | 10 |
 | `SYSCALL` | no operands | `0F 05` | 2 |
 
-Symbolic MOV remains parser-only and is rejected by the encoder, even when
-the supplied symbol mapping contains its name. The complete target matrix is:
+DB is supported only after instructions. The complete target matrix is:
 
 | Instruction | Operand form | Purpose |
 |---|---|---|
@@ -328,17 +345,17 @@ A working Hello World needs only `MOV r64, imm64`, `SYSCALL`, labels, and `db`:
 _start:
     mov rax, 1          ; Linux write syscall
     mov rdi, 1          ; stdout
-    mov rsi, message    ; fixed virtual address of data label
-    mov rdx, 13         ; byte count
+    mov rsi, msg        ; fixed virtual address of data label
+    mov rdx, 14         ; byte count
     syscall
     mov rax, 60         ; Linux exit syscall
     mov rdi, 0          ; status
     syscall
 
-message: db "Hello World!", 10
+msg: db "Hello, World!", 10
 ```
 
-This avoids memory-addressing modes and linker relocations. `message` is
+This avoids memory-addressing modes and linker relocations. `msg` is
 resolved to an absolute `imm64` in the fixed-address executable. The string
 length is a literal in version one; computed expressions such as
 `message_end - message` are explicitly deferred.
@@ -363,8 +380,12 @@ Both functions validate the form, operand count/types, base-register
 name/code/width consistency and immediate range. They consume the parser's
 normalized lowercase models. Invalid operands use their own source location;
 unsupported mnemonics or wrong operand counts use the instruction location.
-Errors are `ByteForgeError`, with no file I/O or printing. Address and symbol
-arguments are retained for future forms but are unused in Milestone 3.
+Errors are `ByteForgeError`, with no file I/O or printing. `encoded_size()`
+accepts unresolved symbols and returns 10 without a symbol lookup, enabling
+forward references. `encode()` resolves symbolic operands through the supplied
+mapping. Absolute symbol values must be integers in `0..2^64-1`; negative,
+overflowing and noninteger mapped values are rejected at the symbol location.
+The instruction address argument is retained for future relative forms.
 
 MOV accepts integers from `-2^63` through `2^64-1` inclusive. Negative values
 use their 64-bit two's-complement representation. Values are range-checked
@@ -392,13 +413,12 @@ Future helper designs (not implemented in this milestone):
   `target - (address + instruction_size)`, require signed 32-bit range and
   pack with `<i`. JMP remains five bytes, JE/JNE six; no branch relaxation.
 
-Later symbolic MOV and branch handlers can consume the existing
-`SymbolReference`, address and symbol mapping without changing public
-interfaces. Sizing must accept unresolved references once those forms are
-introduced. Arithmetic/register forms fit the existing operand models, but
-will require approved parser extensions. The resolver now owns instruction
-layout and label collection; the ELF writer consumes assembled bytes downstream.
-No additional instruction, symbol-reference encoding or branch logic is implemented yet.
+Symbolic MOV uses the existing `SymbolReference` and symbol mapping without
+changing public interfaces. Future branch handlers can use the address and
+mapping similarly. Arithmetic/register forms fit the existing operand models,
+but will require approved parser extensions. The resolver owns instruction/data
+layout and label collection; the ELF writer consumes the separate payloads.
+No arithmetic, branch logic or additional executable format is implemented.
 
 Important fixed choices:
 

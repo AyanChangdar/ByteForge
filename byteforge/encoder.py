@@ -1,10 +1,10 @@
-"""Handwritten encodings for MOV r64, imm64 and SYSCALL."""
+"""Handwritten encodings for MOV r64, integer/symbol and SYSCALL."""
 
 from collections.abc import Mapping
 import struct
 
 from byteforge.model import (
-    ByteForgeError, Immediate, Instruction, Register, SourceLocation,
+    ByteForgeError, Immediate, Instruction, Register, SourceLocation, SymbolReference,
 )
 
 
@@ -14,6 +14,7 @@ _BASE_REGISTER_CODES = {
 }
 _FORM_SIZES = {
     ("mov", (Register, Immediate)): 10,
+    ("mov", (Register, SymbolReference)): 10,
     ("syscall", ()): 2,
 }
 _MIN_IMM64 = -(1 << 63)
@@ -57,7 +58,7 @@ def _validate(instruction: Instruction) -> int:
     mnemonic = instruction.mnemonic
     if mnemonic not in ("mov", "syscall"):
         raise ByteForgeError(instruction.location, f"Unsupported instruction: {mnemonic}")
-    expected = (Register, Immediate) if mnemonic == "mov" else ()
+    expected = (Register, (Immediate, SymbolReference)) if mnemonic == "mov" else ()
     if len(instruction.operands) != len(expected):
         raise ByteForgeError(
             instruction.location,
@@ -67,13 +68,26 @@ def _validate(instruction: Instruction) -> int:
         if not isinstance(operand, kind):
             raise ByteForgeError(
                 operand.location,
-                "MOV requires a register destination and an integer immediate source",
+                "MOV requires a register destination and an integer immediate or symbol source",
             )
     if mnemonic == "mov":
-        destination, immediate = instruction.operands
+        destination, source = instruction.operands
         _base_register_code(destination)
-        _imm64_bits(immediate.value, immediate.location)
-    return _FORM_SIZES[(mnemonic, expected)]
+        if isinstance(source, Immediate):
+            _imm64_bits(source.value, source.location)
+            return _FORM_SIZES[(mnemonic, (Register, Immediate))]
+        return _FORM_SIZES[(mnemonic, (Register, SymbolReference))]
+    return _FORM_SIZES[(mnemonic, ())]
+
+
+def _symbol_address(source: SymbolReference, symbols: Mapping[str, int]) -> int:
+    try:
+        value = symbols[source.name]
+    except KeyError:
+        raise ByteForgeError(source.location, f"Undefined symbol: {source.name}") from None
+    if type(value) is not int or not 0 <= value <= _MAX_IMM64:
+        raise ByteForgeError(source.location, "Symbol address must be an unsigned 64-bit integer")
+    return value
 
 
 def encoded_size(instruction: Instruction) -> int:
@@ -84,18 +98,20 @@ def encoded_size(instruction: Instruction) -> int:
 def encode(
     instruction: Instruction, address: int, symbols: Mapping[str, int]
 ) -> bytes:
-    """Encode one instruction; address and symbols are reserved for later forms.
+    """Encode one instruction using final absolute symbol addresses.
 
-    Symbolic MOV is deliberately unsupported, even when symbols has its name.
-    No file I/O, output, symbol resolution or address-dependent encoding occurs.
+    The instruction address is reserved for future relative branch forms.
+    No file I/O or printing occurs.
     """
     _validate(instruction)
     if instruction.mnemonic == "syscall":
         return b"\x0f\x05"
-    destination, immediate = instruction.operands
+    destination, source = instruction.operands
     code = _base_register_code(destination)
+    value = (_symbol_address(source, symbols) if isinstance(source, SymbolReference)
+             else source.value)
     return (
         _rex(w=1)
         + bytes((0xB8 + code,))
-        + _pack_imm64(immediate.value, immediate.location)
+        + _pack_imm64(value, source.location)
     )

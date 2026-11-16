@@ -1,4 +1,4 @@
-"""CLI and pipeline tests; execute only the fixed exit fixture on Linux x86-64."""
+"""CLI tests; native tests execute only the fixed exit and Hello World fixtures."""
 
 import os
 from pathlib import Path
@@ -18,6 +18,12 @@ from byteforge.resolver import assemble
 
 ROOT = Path(__file__).resolve().parents[1]
 EXIT_SOURCE = "_start:\n    mov rax, 60\n    mov rdi, 7\n    syscall\n"
+HELLO_SOURCE = (
+    '_start:\n    mov rax, 1\n    mov rdi, 1\n    mov rsi, msg\n'
+    '    mov rdx, 14\n    syscall\n\n'
+    '    mov rax, 60\n    mov rdi, 0\n    syscall\n\n'
+    'msg: db "Hello, World!", 10\n'
+)
 NATIVE_LINUX = sys.platform == "linux" and platform.machine().lower() in ("x86_64", "amd64")
 
 
@@ -73,15 +79,55 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(process.returncode, 1)
         self.assertIn(f"{self.source}:1:1:", process.stderr)
 
-    def test_cli_rejects_data_and_symbolic_mov(self):
-        for source, message in (('_start: syscall\ndb ""', "DB directives"),
-                                ("_start: mov rsi, target", "integer immediate")):
+    def test_cli_rejects_interleaving_and_undefined_symbols(self):
+        for source, message in (('_start: syscall\ndb ""\nsyscall', "cannot follow a DB"),
+                                ("_start: mov rsi, target", "Undefined symbol: target")):
             with self.subTest(source=source):
                 self.source.write_text(source, encoding="utf-8")
                 process = self.run_cli()
                 self.assertEqual(process.returncode, 1)
                 self.assertIn(message, process.stderr)
                 self.assertFalse(self.output.exists())
+
+    def test_cli_builds_hello_world(self):
+        self.source.write_text(HELLO_SOURCE, encoding="utf-8")
+        process = self.run_cli()
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertIn("4174 bytes, entry 0x401000", process.stdout)
+        image = self.output.read_bytes()
+        self.assertEqual(len(image), 4174)
+        self.assertEqual(image[0x1040:], b"Hello, World!\n")
+        self.assertEqual(image[0x1014:0x101E], bytes.fromhex("48 BE 40 10 40 00 00 00 00 00"))
+        self.assertEqual(struct.unpack_from("<Q", image, 24)[0], 0x401000)
+        self.assertEqual(struct.unpack_from("<QQ", image, 96), (4174, 4174))
+
+    def test_cli_undefined_symbol_has_precise_location(self):
+        line = "    mov rsi, missing ; preserve source"
+        self.source.write_text("_start:\n" + line, encoding="utf-8")
+        process = self.run_cli()
+        self.assertEqual(process.returncode, 1)
+        self.assertIn(f"{self.source}:2:14: Undefined symbol: missing", process.stderr)
+        self.assertIn(line + "\n             ^", process.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_cli_hello_world_is_deterministic(self):
+        self.source.write_text(HELLO_SOURCE, encoding="utf-8")
+        first = self.run_cli()
+        other = self.directory / "hello-second"
+        second = self.run_cli(output=other)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.output.read_bytes(), other.read_bytes())
+
+    def test_checked_in_hello_example_matches_fixture(self):
+        source = (ROOT / "examples" / "hello.asm").read_text(encoding="utf-8")
+        self.assertEqual(source, HELLO_SOURCE)
+
+    def test_cli_accepts_empty_data(self):
+        self.source.write_text(EXIT_SOURCE + 'empty: db ""\n', encoding="utf-8")
+        process = self.run_cli()
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(len(self.output.read_bytes()), 4118)
 
     def test_cli_preserves_existing_output(self):
         self.output.parent.mkdir()
@@ -156,6 +202,20 @@ class IntegrationTests(unittest.TestCase):
         )
         self.assertEqual(native.returncode, 7)
         self.assertEqual(native.stdout, b"")
+        self.assertEqual(native.stderr, b"")
+
+    @unittest.skipUnless(NATIVE_LINUX, "Native Linux execution not tested: requires Linux x86-64")
+    def test_native_linux_hello_world(self):
+        # Only this known fixture is executed, never arbitrary user assembly.
+        self.source.write_text(HELLO_SOURCE, encoding="utf-8")
+        process = self.run_cli()
+        self.assertEqual(process.returncode, 0, process.stderr)
+        native = subprocess.run(
+            [str(self.output)], cwd=self.directory, capture_output=True,
+            timeout=5, check=False,
+        )
+        self.assertEqual(native.stdout, b"Hello, World!\n")
+        self.assertEqual(native.returncode, 0)
         self.assertEqual(native.stderr, b"")
 
 

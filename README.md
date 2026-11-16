@@ -19,23 +19,24 @@ source.asm -> parser -> symbol/layout passes -> x86-64 encoder
                                     -> JSON report -> HTML visualizer
 ```
 
-Milestone 4 implements source parsing, instruction layout, label collection,
-MOV-immediate/SYSCALL encoding, ELF generation and a CLI. A case-sensitive
-`_start` label must identify an instruction. DB and symbolic MOV can be parsed
-but are rejected during assembly. Arithmetic, branches, string printing,
-reports and visualization remain planned.
+Milestone 5A implements source parsing, two-pass code/data layout, label
+collection, MOV-immediate/symbol and SYSCALL encoding, ELF generation and a CLI.
+A case-sensitive `_start` label must identify an instruction. DB bytes follow
+instructions; any instruction after the first DB (even `db ""`) is rejected.
+Arithmetic, branches, reports and visualization remain planned.
 
 The HTML/CSS/JavaScript visualizer will display source instructions, virtual
 addresses, encoded bytes, resolved symbols, and the generated ELF layout. It
 is a build-time explanation tool, not a CPU emulator.
 
-## Usage (Milestone 4)
+## Usage (Milestone 5A)
 
 Python 3.10 or newer is required to build files; no packages are needed.
 From the repository root:
 
 ```bash
 python -m byteforge.cli examples/exit.asm -o build/exit
+python -m byteforge.cli examples/hello.asm -o build/hello
 ```
 
 The CLI creates missing output directories and refuses to overwrite an
@@ -43,7 +44,7 @@ existing output or the source file. It sets owner-execute permission on POSIX.
 Assembly errors show filename, line, column, original text and a caret.
 Success returns status 0; build/file errors return 1; argument errors return 2.
 
-The example is:
+The exit-status-7 regression example is:
 
 ```asm
 _start:
@@ -64,6 +65,23 @@ chmod +x build/exit
 echo $?                 # expected: 7
 ```
 
+The Hello World example uses `mov rsi, msg` to load an absolute data address
+and `msg: db "Hello, World!", 10` to define 14 bytes. Its ELF contains 64 code
+bytes followed immediately by those bytes at file offset `0x1040` / virtual
+address `0x401040`. File size is 4174 bytes and entry remains `0x401000`.
+
+```bash
+chmod +x build/hello
+./build/hello           # prints Hello, World! followed by a newline
+echo $?                # expected: 0
+```
+
+Labels preserve case. Undefined symbols and duplicate labels produce source
+diagnostics. Numeric MOV retains its original `-2^63..2^64-1` range; symbolic
+MOV uses unsigned 64-bit virtual addresses. Both encodings are always 10 bytes.
+Strings are ASCII with the documented escape set. Data has no implicit NUL
+terminator, and syscall byte counts remain literal values in source.
+
 Windows can generate the same ELF file but cannot execute it directly. Copy
 it to Linux/WSL and apply executable permissions there if necessary. The CLI
 only builds files; it never runs generated programs.
@@ -78,19 +96,24 @@ Focused checks for this milestone:
 
 ```bash
 python -m unittest discover -s tests -p test_resolver.py
+python -m unittest discover -s tests -p test_encoder.py
 python -m unittest discover -s tests -p test_elf.py
 python -m unittest discover -s tests -p test_integration.py
 ```
 
-Structural and CLI tests run on Windows and Linux. The native test executes
-only a fixed exit-status-7 fixture, with a timeout, on Linux x86-64. It is
-explicitly skipped elsewhere; a skip does not verify native execution.
+Structural and CLI tests run on Windows and Linux. Native tests execute only
+the fixed exit-status-7 and Hello World fixtures, with timeouts, on Linux
+x86-64. They are explicitly skipped elsewhere; a skip does not verify native
+execution. The Hello World test checks exact stdout `b"Hello, World!\n"`
+and return code 0; the original native exit test still checks return code 7.
 
 Optional development-only Linux checks:
 
 ```bash
 file build/exit
 readelf -h -l build/exit
+file build/hello
+readelf -h -l build/hello
 ```
 
 The ELF has no section table, so plain `objdump -d` may not display its code.
@@ -106,5 +129,5 @@ ByteForge will not implement dynamic linking, object files, macros, complex
 expressions, full x86-64 coverage, CPU emulation, KVM integration, or external
 assembler/linker invocation. Linux x86-64 is the only execution target.
 The current assembler does not prove that arbitrary instruction sequences
-terminate or use Linux syscalls correctly. Symbol-reference encoding and
-data payloads are deferred to a later milestone.
+terminate or use Linux syscalls correctly. Writable data, computed expressions,
+arithmetic, branches and the visualizer remain deferred.

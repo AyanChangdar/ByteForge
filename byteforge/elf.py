@@ -28,8 +28,6 @@ def _validate_config(config: ElfConfig) -> None:
 
 def _validate_result(result: AssemblyResult, code_address: int) -> int:
     """Reject inconsistent result objects before serializing an executable."""
-    if result.data:
-        raise ValueError("ELF data payloads are not supported in this milestone")
     if not result.code or not result.items:
         raise ValueError("Executable must contain instructions")
     address = code_address
@@ -57,7 +55,7 @@ def build_executable(
     """
     _validate_config(config)
     entry = _validate_result(result, config.image_base + config.code_offset)
-    file_size = config.code_offset + len(result.code)
+    file_size = config.code_offset + len(result.code) + len(result.data)
     if file_size >= (1 << 64) or config.image_base + file_size > (1 << 64):
         raise ValueError("ELF image exceeds the 64-bit address range")
 
@@ -72,7 +70,7 @@ def build_executable(
         segment.p_paddr, segment.p_filesz, segment.p_memsz, segment.p_align,
     )
     padding_size = config.code_offset - len(header) - len(program_header)
-    image = header + program_header + bytes(padding_size) + result.code
+    image = header + program_header + bytes(padding_size) + result.code + result.data
     if len(image) != file_size:
         raise ValueError("ELF output length does not match its segment size")
     return image, ElfLayout(entry, [segment], file_size)

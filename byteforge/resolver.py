@@ -1,9 +1,9 @@
-"""Lay out instructions and collect labels without encoding symbol references."""
+"""Two-pass assembly of instructions followed by read-only DB bytes."""
 
 from byteforge.encoder import encode, encoded_size
 from byteforge.model import (
     AssemblyResult, ByteForgeError, DataDirective, EncodedItem, Instruction,
-    Label, Program, SourceLocation,
+    Label, Program, SourceLocation, SymbolReference,
 )
 
 
@@ -19,16 +19,26 @@ def assemble(
     symbols: dict[str, int] = {}
     definitions: dict[str, SourceLocation] = {}
     planned: list[tuple[Instruction, int, int]] = []
+    data_payload = bytearray()
+    in_data = False
     address = base_address
     for statement in program.statements:
         if isinstance(statement, Label):
             if statement.name in symbols:
                 raise ByteForgeError(statement.location, f"Duplicate label: {statement.name}")
+            if address >= (1 << 64):
+                raise ByteForgeError(statement.location, "Label exceeds the 64-bit address range")
             symbols[statement.name] = address
             definitions[statement.name] = statement.location
         elif isinstance(statement, DataDirective):
-            raise ByteForgeError(statement.location, "DB directives are not supported in this milestone")
+            in_data = True
+            if address + len(statement.data) > (1 << 64):
+                raise ByteForgeError(statement.location, "Data exceeds the 64-bit address range")
+            data_payload.extend(statement.data)
+            address += len(statement.data)
         else:
+            if in_data:
+                raise ByteForgeError(statement.location, "Instructions cannot follow a DB directive")
             size = encoded_size(statement)
             if address + size > (1 << 64):
                 raise ByteForgeError(statement.location, "Instruction exceeds the 64-bit address range")
@@ -38,12 +48,14 @@ def assemble(
     if "_start" not in symbols:
         raise ByteForgeError(fallback, "Required entry label _start is missing")
     if symbols["_start"] not in {item_address for _, item_address, _ in planned}:
-        raise ByteForgeError(definitions["_start"], "_start must identify an instruction, not the end of code")
+        raise ByteForgeError(definitions["_start"], "_start must identify an instruction, not the end of code or data")
 
     items = []
     for instruction, item_address, size in planned:
         data = encode(instruction, item_address, symbols)
         if len(data) != size:
             raise ByteForgeError(instruction.location, "Encoder size mismatch during assembly")
-        items.append(EncodedItem(item_address, data, instruction))
-    return AssemblyResult(b"".join(item.data for item in items), b"", symbols, items)
+        resolution = {operand.name: symbols[operand.name] for operand in instruction.operands
+                      if isinstance(operand, SymbolReference)}
+        items.append(EncodedItem(item_address, data, instruction, resolution))
+    return AssemblyResult(b"".join(item.data for item in items), bytes(data_payload), symbols, items)
