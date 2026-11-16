@@ -35,6 +35,7 @@ ByteForge/
 |   |-- styles.css
 |   `-- app.js
 |-- examples/
+|   |-- arithmetic.asm    # implemented arithmetic exit-status-7 demo
 |   |-- exit.asm          # implemented exit-status-7 demo
 |   |-- hello.asm
 |   |-- loop.asm
@@ -48,9 +49,10 @@ ByteForge/
 `-- build/                 # ignored generated artifacts
 ```
 
-Milestone 5A implements the model, parser, MOV-immediate/symbol encoder,
-two-pass resolver, ELF writer, CLI, exit/Hello World examples and their tests.
-Arithmetic, branches, reports and visualization remain planned.
+Stage 5B.1 extends the existing pipeline with fixed-imm32 ADD, SUB, CMP and
+register-register XOR, plus an arithmetic example. MOV-immediate/symbol,
+SYSCALL, code/data layout, ELF generation and the CLI remain supported.
+Branches, reports and visualization remain planned.
 
 ## 3. Shared data model and interfaces
 
@@ -155,11 +157,13 @@ characters. Missing input is marked immediately after the last syntactic token,
 before trailing whitespace or a comment. Parsing stops at the first
 `ByteForgeError`.
 
-Implemented Milestone 2 grammar:
+Implemented Stage 5B.1 grammar:
 
 ```text
 line       := [label ":"] [instruction | data] [";" comment]
 instruction:= "mov" register "," (integer | identifier) | "syscall"
+            | ("add" | "sub" | "cmp") register "," integer
+            | "xor" register "," register
 data       := "db" value ["," value ...]
 value      := string | integer
 integer    := ["+" | "-"] (decimal_digits | "0x" hexadecimal_digits)
@@ -180,6 +184,14 @@ are reserved and rejected in operand positions. Other identifiers, including
 `raq` or `r8_buffer`, are permitted as symbolic sources. MOV immediate values
 retain their integer value; encoding-width validation belongs to the encoder.
 Python's integer conversion limits may reject exceptionally large literals.
+
+ADD, SUB and CMP require a base 64-bit register destination and an integer
+source. XOR requires two base 64-bit registers, with destination first.
+The parser rejects arithmetic symbols/register sources, XOR immediates,
+memory operands, unsupported registers and wrong operand counts. Encoding-width
+range checks remain in the encoder. Existing quoting, comments, labels, DB,
+numeric literal rules and source-location conventions are unchanged. JMP,
+JE and JNE are still unknown instructions in Stage 5B.1.
 
 DB accepts a nonempty comma-separated sequence of double-quoted ASCII strings
 and numeric bytes in `0..255`. Empty strings are allowed. Strings support only
@@ -305,16 +317,23 @@ and an ELF layout diagram. It does not execute or emulate instructions.
 
 ## 5. Supported instruction forms
 
-Keep the encoding matrix explicit and small. The parser accepts
-`MOV r64, integer/symbol` and `SYSCALL`. Milestone 5A encodes these forms:
+Keep the encoding matrix explicit and small. Stage 5B.1 supports exactly
+the following instruction forms, using only the eight base 64-bit registers:
 
 | Instruction | Operand form | Bytes | Size |
 |---|---|---|---|
 | `MOV` | base `r64, integer` | `48`, `B8 + register_code`, little-endian imm64 | 10 |
 | `MOV` | base `r64, symbol` | same form, with the resolved absolute virtual address | 10 |
 | `SYSCALL` | no operands | `0F 05` | 2 |
+| `ADD` | base `r64, signed imm32` | `48 81`, ModR/M `/0`, imm32 | 7 |
+| `SUB` | base `r64, signed imm32` | `48 81`, ModR/M `/5`, imm32 | 7 |
+| `CMP` | base `r64, signed imm32` | `48 81`, ModR/M `/7`, imm32 | 7 |
+| `XOR` | base `r64, r64` | `48 31`, register-direct ModR/M | 3 |
 
-DB is supported only after instructions. The complete target matrix is:
+DB is supported only after instructions. Arithmetic imm8 optimizations,
+register-register ADD/SUB/CMP, register-register MOV, XOR immediates and all
+branches are unsupported. The broader target matrix below includes deferred
+forms and must not be read as the implemented subset:
 
 | Instruction | Operand form | Purpose |
 |---|---|---|
@@ -394,38 +413,53 @@ are rejected rather than truncated. Noninteger values in constructed
 `Immediate` models are rejected. MOV always uses the ten-byte form, including
 for zero or small immediates. SYSCALL is always two bytes.
 
+ADD/SUB/CMP always use Group 1 opcode `81`, REX.W and a signed imm32 packed
+with `<i`. Accept exactly `-2147483648..2147483647`; the CPU sign-extends the
+immediate to 64 bits. Positive `0xFFFFFFFF` is rejected while `-1` is accepted.
+ModR/M is `0xC0 | (extension << 3) | destination_code`, where ADD is `/0`,
+SUB `/5` and CMP `/7`. No imm8 or accumulator-specific encodings are selected.
+Lengths remain seven bytes for every register and immediate value.
+
+XOR uses `48 31` and ModR/M `0xC0 | (source_code << 3) | destination_code`.
+Opcode 31 writes the r/m operand: the first assembly operand is the destination
+and the second occupies reg. Thus `xor rax, rbx` is `48 31 D8`; reversing the
+operands gives different bytes and changes the destination. XOR is three bytes.
+All register metadata is validated by both sizing and encoding. The arithmetic
+demo is 36 code bytes (4132 ELF bytes), enters at `0x401000` and computes exit
+status 7. CMP changes flags only; conditional use awaits Stage 5B.2.
+
 Current private helpers are `_base_register_code(register)` for register
 validation, `_rex(w, r=0, x=0, b=0)` for prefix composition, and
 `_pack_imm64(value, location)` for validated little-endian immediate bytes.
 `_imm64_bits(value, location)` shares range validation between sizing and
 packing. REX is `0x40 | W<<3 | R<<2 | X<<1 | B`; current MOV sets only W.
-The encoder checks register metadata independently of the parser, so manually
+`_modrm_register(reg_code, rm_code)` composes register-only ModR/M from validated
+codes/opcode extensions. `_pack_imm32(value, location)` validates and packs a
+signed 32-bit value for arithmetic; shared validation calls it during sizing
+as well. The encoder checks register metadata independently of the parser, so manually
 constructed mismatched registers cannot silently select another destination.
 
 Future helper designs (not implemented in this milestone):
 
-- `_modrm_register(reg_code, rm_code)` will compose register-only ModR/M:
-  `0xC0 | (reg_code << 3) | rm_code`, after base-register validation. Opcode
-  handlers will explicitly choose register direction or the opcode extension.
 - `_pack_signed(value, bits, location)` will check signed ranges and use
-  explicit little-endian formats for arithmetic immediates and displacements.
+  explicit little-endian formats if additional signed widths become necessary.
 - `_rel32(target, address, instruction_size, location)` will calculate
   `target - (address + instruction_size)`, require signed 32-bit range and
   pack with `<i`. JMP remains five bytes, JE/JNE six; no branch relaxation.
 
 Symbolic MOV uses the existing `SymbolReference` and symbol mapping without
 changing public interfaces. Future branch handlers can use the address and
-mapping similarly. Arithmetic/register forms fit the existing operand models,
-but will require approved parser extensions. The resolver owns instruction/data
+mapping similarly. Stage 5B.1 arithmetic reuses the existing operand models and
+public signatures. The unchanged resolver owns instruction/data
 layout and label collection; the ELF writer consumes the separate payloads.
-No arithmetic, branch logic or additional executable format is implemented.
+No branch logic or additional executable format is implemented.
 
 Important fixed choices:
 
 - register-to-register operations use 64-bit operand size (`REX.W=1`);
 - `MOV r64, imm64` uses `REX.W + B8+rd + imm64`;
-- immediate arithmetic prefers a documented deterministic form; size decisions
-  must be identical in `encoded_size()` and `encode()`;
+- immediate arithmetic uses fixed seven-byte `81` forms; size decisions
+  are identical in `encoded_size()` and `encode()`;
 - `JMP` uses `E9 rel32`; `JE` uses `0F 84 rel32`; `JNE` uses `0F 85 rel32`;
 - `SYSCALL` uses `0F 05`;
 - all multibyte values are little endian.

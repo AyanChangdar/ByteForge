@@ -1,5 +1,6 @@
-"""CLI tests; native tests execute only the fixed exit and Hello World fixtures."""
+"""CLI tests; native tests execute only the fixed demonstration fixtures."""
 
+import hashlib
 import os
 from pathlib import Path
 import platform
@@ -24,6 +25,10 @@ HELLO_SOURCE = (
     '    mov rax, 60\n    mov rdi, 0\n    syscall\n\n'
     'msg: db "Hello, World!", 10\n'
 )
+ARITHMETIC_SOURCE = (
+    "_start:\n    xor rdi, rdi\n    add rdi, 10\n    sub rdi, 3\n"
+    "    cmp rdi, 7\n    mov rax, 60\n    syscall\n"
+)
 NATIVE_LINUX = sys.platform == "linux" and platform.machine().lower() in ("x86_64", "amd64")
 
 
@@ -42,6 +47,67 @@ class IntegrationTests(unittest.TestCase):
              "-o", str(output or self.output)],
             cwd=ROOT, capture_output=True, text=True, timeout=10, check=False,
         )
+
+    def test_cli_builds_arithmetic_example(self):
+        process = self.run_cli(source=ROOT / "examples" / "arithmetic.asm")
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertIn("4132 bytes, entry 0x401000", process.stdout)
+        image = self.output.read_bytes()
+        self.assertEqual(len(image), 4132)
+        self.assertEqual(struct.unpack_from("<Q", image, 24)[0], 0x401000)
+        self.assertEqual(struct.unpack_from("<QQ", image, 96), (4132, 4132))
+        self.assertEqual(image[4096:], bytes.fromhex(
+            "48 31 FF 48 81 C7 0A 00 00 00 48 81 EF 03 00 00 00 "
+            "48 81 FF 07 00 00 00 48 B8 3C 00 00 00 00 00 00 00 0F 05"
+        ))
+
+    def test_checked_in_arithmetic_example_matches_fixture(self):
+        self.assertEqual((ROOT / "examples" / "arithmetic.asm").read_text(encoding="utf-8"),
+                         ARITHMETIC_SOURCE)
+
+    def test_arithmetic_cli_is_deterministic(self):
+        self.source.write_text(ARITHMETIC_SOURCE, encoding="utf-8")
+        first = self.run_cli()
+        other = self.directory / "arithmetic-second"
+        second = self.run_cli(output=other)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.output.read_bytes(), other.read_bytes())
+
+    def test_arithmetic_cli_range_diagnostic(self):
+        self.source.write_text("_start:\n    add rdi, 2147483648 ; original", encoding="utf-8")
+        process = self.run_cli()
+        self.assertEqual(process.returncode, 1)
+        self.assertIn(f"{self.source}:2:14:", process.stderr)
+        self.assertIn("signed 32-bit", process.stderr)
+        self.assertNotIn("Traceback", process.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_cli_still_rejects_branches_and_nop(self):
+        for instruction in ("jmp target", "je target", "jne target", "nop"):
+            with self.subTest(instruction=instruction):
+                self.source.write_text("_start: " + instruction, encoding="utf-8")
+                process = self.run_cli()
+                self.assertEqual(process.returncode, 1)
+                self.assertIn("Unknown instruction", process.stderr)
+                self.assertFalse(self.output.exists())
+
+    def test_existing_examples_complete_binary_regression(self):
+        # Captured from the complete Milestone 5A images before arithmetic changes.
+        expected = {
+            "hello": (4174, "55410a57a5cf142e44835579df407658b25487a457378e893252f8ecfd12e867"),
+            "exit": (4118, "954fe1ffdda4594e9c90f21d383e07632e93477a631d47338e59d5aef6d0c8ae"),
+        }
+        for name, (size, digest) in expected.items():
+            with self.subTest(example=name):
+                output = self.directory / name
+                process = self.run_cli(source=ROOT / "examples" / (name + ".asm"), output=output)
+                self.assertEqual(process.returncode, 0, process.stderr)
+                image = output.read_bytes()
+                self.assertEqual(len(image), size)
+                self.assertEqual(hashlib.sha256(image).hexdigest(), digest)
+                self.assertEqual(struct.unpack_from("<Q", image, 24)[0], 0x401000)
+                self.assertEqual(struct.unpack_from("<QQ", image, 96), (size, size))
 
     def test_cli_creates_directory_and_exact_executable(self):
         process = self.run_cli()
@@ -216,6 +282,20 @@ class IntegrationTests(unittest.TestCase):
         )
         self.assertEqual(native.stdout, b"Hello, World!\n")
         self.assertEqual(native.returncode, 0)
+        self.assertEqual(native.stderr, b"")
+
+    @unittest.skipUnless(NATIVE_LINUX, "Native Linux execution not tested: requires Linux x86-64")
+    def test_native_linux_arithmetic_exit_status_seven(self):
+        # Execute only the fixed arithmetic fixture, never arbitrary user input.
+        self.source.write_text(ARITHMETIC_SOURCE, encoding="utf-8")
+        process = self.run_cli()
+        self.assertEqual(process.returncode, 0, process.stderr)
+        native = subprocess.run(
+            [str(self.output)], cwd=self.directory, capture_output=True,
+            timeout=5, check=False,
+        )
+        self.assertEqual(native.returncode, 7)
+        self.assertEqual(native.stdout, b"")
         self.assertEqual(native.stderr, b"")
 
 

@@ -1,4 +1,4 @@
-"""Handwritten encodings for MOV r64, integer/symbol and SYSCALL."""
+"""Handwritten MOV, fixed-imm32 arithmetic, register XOR and SYSCALL encodings."""
 
 from collections.abc import Mapping
 import struct
@@ -16,7 +16,12 @@ _FORM_SIZES = {
     ("mov", (Register, Immediate)): 10,
     ("mov", (Register, SymbolReference)): 10,
     ("syscall", ()): 2,
+    ("add", (Register, Immediate)): 7,
+    ("sub", (Register, Immediate)): 7,
+    ("cmp", (Register, Immediate)): 7,
+    ("xor", (Register, Register)): 3,
 }
+_GROUP1_EXTENSIONS = {"add": 0, "sub": 5, "cmp": 7}
 _MIN_IMM64 = -(1 << 63)
 _MAX_IMM64 = (1 << 64) - 1
 
@@ -53,12 +58,34 @@ def _pack_imm64(value: int, location: SourceLocation) -> bytes:
     return struct.pack("<Q", _imm64_bits(value, location))
 
 
+def _pack_imm32(value: int, location: SourceLocation) -> bytes:
+    if type(value) is not int or not -(1 << 31) <= value < (1 << 31):
+        raise ByteForgeError(location, "Arithmetic immediate must be a signed 32-bit integer")
+    return struct.pack("<i", value)
+
+
+def _modrm_register(reg_code: int, rm_code: int) -> bytes:
+    """Compose mod=3 using already validated register codes/opcode extensions."""
+    return bytes((0xC0 | (reg_code << 3) | rm_code,))
+
+
 def _validate(instruction: Instruction) -> int:
     """Share form, register and range checks between sizing and emission."""
     mnemonic = instruction.mnemonic
-    if mnemonic not in ("mov", "syscall"):
+    if mnemonic not in ("mov", "syscall", "add", "sub", "cmp", "xor"):
         raise ByteForgeError(instruction.location, f"Unsupported instruction: {mnemonic}")
-    expected = (Register, (Immediate, SymbolReference)) if mnemonic == "mov" else ()
+    if mnemonic == "mov":
+        expected = (Register, (Immediate, SymbolReference))
+        form_message = "MOV requires a register destination and an integer immediate or symbol source"
+    elif mnemonic in _GROUP1_EXTENSIONS:
+        expected = (Register, Immediate)
+        form_message = f"{mnemonic.upper()} requires a register destination and an integer immediate source"
+    elif mnemonic == "xor":
+        expected = (Register, Register)
+        form_message = "XOR requires two register operands"
+    else:
+        expected = ()
+        form_message = "SYSCALL requires no operands"
     if len(instruction.operands) != len(expected):
         raise ByteForgeError(
             instruction.location,
@@ -66,10 +93,16 @@ def _validate(instruction: Instruction) -> int:
         )
     for operand, kind in zip(instruction.operands, expected):
         if not isinstance(operand, kind):
-            raise ByteForgeError(
-                operand.location,
-                "MOV requires a register destination and an integer immediate or symbol source",
-            )
+            raise ByteForgeError(operand.location, form_message)
+    if mnemonic in _GROUP1_EXTENSIONS:
+        destination, source = instruction.operands
+        _base_register_code(destination)
+        _pack_imm32(source.value, source.location)
+        return _FORM_SIZES[(mnemonic, (Register, Immediate))]
+    if mnemonic == "xor":
+        for operand in instruction.operands:
+            _base_register_code(operand)
+        return _FORM_SIZES[(mnemonic, (Register, Register))]
     if mnemonic == "mov":
         destination, source = instruction.operands
         _base_register_code(destination)
@@ -108,6 +141,13 @@ def encode(
         return b"\x0f\x05"
     destination, source = instruction.operands
     code = _base_register_code(destination)
+    if instruction.mnemonic in _GROUP1_EXTENSIONS:
+        return (_rex(w=1) + b"\x81"
+                + _modrm_register(_GROUP1_EXTENSIONS[instruction.mnemonic], code)
+                + _pack_imm32(source.value, source.location))
+    if instruction.mnemonic == "xor":
+        # Opcode 31 writes r/m (destination); reg supplies the source.
+        return _rex(w=1) + b"\x31" + _modrm_register(_base_register_code(source), code)
     value = (_symbol_address(source, symbols) if isinstance(source, SymbolReference)
              else source.value)
     return (

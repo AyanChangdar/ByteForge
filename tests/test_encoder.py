@@ -100,10 +100,143 @@ class EncoderTests(unittest.TestCase):
 
     def test_unsupported_mnemonics(self):
         instruction = self.instruction("mov rax, 1")
-        for mnemonic in ("add", "sub", "xor", "cmp", "jmp", "je", "jne", "nop"):
+        for mnemonic in ("jmp", "je", "jne", "nop"):
             with self.subTest(mnemonic=mnemonic):
                 self.assert_rejected(replace(instruction, mnemonic=mnemonic),
                                      instruction.location, "Unsupported instruction")
+
+    def test_arithmetic_documented_golden_bytes(self):
+        for source, expected in (
+            ("add rax, 5", "48 81 C0 05 00 00 00"),
+            ("sub rcx, 1", "48 81 E9 01 00 00 00"),
+            ("cmp rcx, 0", "48 81 F9 00 00 00 00"),
+            ("xor rdi, rdi", "48 31 FF"),
+            ("xor rax, rbx", "48 31 D8"),
+        ):
+            with self.subTest(source=source):
+                instruction = self.instruction(source)
+                data = encode(instruction, 0, {})
+                self.assertEqual(data, bytes.fromhex(expected))
+                self.assertEqual(encoded_size(instruction), len(data))
+
+    def test_group1_golden_bytes_for_every_register(self):
+        registers = ("rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi")
+        modrm_bytes = {
+            "add": ("C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7"),
+            "sub": ("E8", "E9", "EA", "EB", "EC", "ED", "EE", "EF"),
+            "cmp": ("F8", "F9", "FA", "FB", "FC", "FD", "FE", "FF"),
+        }
+        for mnemonic, golden in modrm_bytes.items():
+            for register, modrm in zip(registers, golden):
+                with self.subTest(mnemonic=mnemonic, register=register):
+                    instruction = self.instruction(f"{mnemonic} {register}, 5")
+                    data = encode(instruction, 0, {})
+                    self.assertEqual(data, bytes.fromhex(f"48 81 {modrm} 05 00 00 00"))
+                    self.assertEqual(len(data), 7)
+                    self.assertEqual(encoded_size(instruction), 7)
+
+    def test_all_64_xor_register_pairs(self):
+        registers = ("rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi")
+        # Rows are destinations, columns are sources. These literals form the oracle.
+        golden = (
+            "C0 C8 D0 D8 E0 E8 F0 F8", "C1 C9 D1 D9 E1 E9 F1 F9",
+            "C2 CA D2 DA E2 EA F2 FA", "C3 CB D3 DB E3 EB F3 FB",
+            "C4 CC D4 DC E4 EC F4 FC", "C5 CD D5 DD E5 ED F5 FD",
+            "C6 CE D6 DE E6 EE F6 FE", "C7 CF D7 DF E7 EF F7 FF",
+        )
+        for destination, row in zip(registers, golden):
+            for source, modrm in zip(registers, row.split()):
+                with self.subTest(destination=destination, source=source):
+                    instruction = self.instruction(f"xor {destination}, {source}")
+                    data = encode(instruction, 0, {})
+                    self.assertEqual(data, bytes.fromhex(f"48 31 {modrm}"))
+                    self.assertEqual(len(data), 3)
+                    self.assertEqual(encoded_size(instruction), 3)
+
+    def test_signed_imm32_values_and_little_endian(self):
+        for mnemonic, modrm in (("add", "C0"), ("sub", "E8"), ("cmp", "F8")):
+            for value, golden in (
+                (0, "00 00 00 00"), (1, "01 00 00 00"), (-1, "FF FF FF FF"),
+                (-256, "00 FF FF FF"), (0x12345678, "78 56 34 12"),
+                (-2147483648, "00 00 00 80"), (2147483647, "FF FF FF 7F"),
+            ):
+                with self.subTest(mnemonic=mnemonic, value=value):
+                    instruction = self.instruction(f"{mnemonic} rax, {value}")
+                    self.assertEqual(encode(instruction, 0, {}), bytes.fromhex(f"48 81 {modrm} {golden}"))
+                    self.assertEqual(encoded_size(instruction), 7)
+
+    def test_arithmetic_immediate_overflow_and_underflow(self):
+        for mnemonic in ("add", "sub", "cmp"):
+            for value in (-2147483649, 2147483648, 0xFFFFFFFF, 1 << 64):
+                with self.subTest(mnemonic=mnemonic, value=value):
+                    instruction = self.instruction(f"{mnemonic} rax, {value}")
+                    self.assert_rejected(instruction, instruction.operands[1].location, "signed 32-bit")
+
+    def test_arithmetic_rejects_noninteger_immediate_models(self):
+        for mnemonic in ("add", "sub", "cmp"):
+            instruction = self.instruction(f"{mnemonic} rax, 1")
+            for value in (True, 1.0, "1", None):
+                with self.subTest(mnemonic=mnemonic, value=value):
+                    operand = replace(instruction.operands[1], value=value)
+                    self.assert_rejected(replace(instruction, operands=(instruction.operands[0], operand)),
+                                         operand.location, "signed 32-bit")
+
+    def test_arithmetic_rejects_wrong_operand_models(self):
+        for mnemonic in ("add", "sub", "cmp"):
+            instruction = self.instruction(f"{mnemonic} rax, 1")
+            register, immediate = instruction.operands
+            for source in (register, SymbolReference("msg", immediate.location)):
+                with self.subTest(mnemonic=mnemonic, source=source):
+                    self.assert_rejected(replace(instruction, operands=(register, source)),
+                                         source.location, "integer immediate")
+            self.assert_rejected(replace(instruction, operands=(immediate, immediate)),
+                                 immediate.location, "register destination")
+        instruction = self.instruction("xor rax, rbx")
+        for index in (0, 1):
+            operands = list(instruction.operands)
+            location = operands[index].location
+            operands[index] = Immediate(0, location)
+            self.assert_rejected(replace(instruction, operands=tuple(operands)), location, "two register")
+
+    def test_arithmetic_operand_counts(self):
+        for source in ("add rax, 1", "sub rax, 1", "cmp rax, 1", "xor rax, rbx"):
+            instruction = self.instruction(source)
+            for operands in ((), instruction.operands[:1], instruction.operands + instruction.operands[:1]):
+                with self.subTest(source=source, count=len(operands)):
+                    self.assert_rejected(replace(instruction, operands=operands),
+                                         instruction.location, "requires 2 operands")
+
+    def test_arithmetic_rejects_incorrect_register_metadata(self):
+        for source in ("add rax, 1", "sub rax, 1", "cmp rax, 1", "xor rax, rbx"):
+            instruction = self.instruction(source)
+            indexes = (0, 1) if instruction.mnemonic == "xor" else (0,)
+            for index in indexes:
+                for fields in ({"code": 8}, {"code": -1}, {"width": 32},
+                               {"name": "r8"}, {"name": "raq"}, {"code": True}):
+                    with self.subTest(source=source, index=index, fields=fields):
+                        operands = list(instruction.operands)
+                        operands[index] = replace(operands[index], **fields)
+                        self.assert_rejected(replace(instruction, operands=tuple(operands)),
+                                             operands[index].location, "matching name and code")
+
+    def test_arithmetic_range_diagnostic_preserves_source(self):
+        line = "\tADD RDI, 2147483648 ; preserve this  "
+        instruction = parse("; first\n" + line, "arithmetic.asm").statements[0]
+        self.assert_rejected(instruction, SourceLocation("arithmetic.asm", 2, 11, line), "signed 32-bit")
+
+    def test_arithmetic_output_is_deterministic_without_io(self):
+        instructions = [self.instruction(source) for source in
+                        ("add rax, -1", "sub rcx, 1", "cmp rcx, 0", "xor rdi, rax")]
+        before = repr(instructions)
+        symbols = {"unchanged": 123}
+        with patch("builtins.open") as files, patch("sys.stdout") as stdout, patch("sys.stderr") as stderr:
+            for instruction in instructions:
+                self.assertEqual(encode(instruction, 0, symbols), encode(instruction, 100, {}))
+            files.assert_not_called()
+            stdout.write.assert_not_called()
+            stderr.write.assert_not_called()
+        self.assertEqual(repr(instructions), before)
+        self.assertEqual(symbols, {"unchanged": 123})
 
     def test_wrong_mov_operand_counts(self):
         instruction = self.instruction("mov rax, 1")

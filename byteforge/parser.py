@@ -108,20 +108,30 @@ def _operands(tokens: list[_Token], end: SourceLocation) -> list[_Token]:
     return operands
 
 
+def _register(token: _Token, message: str) -> Register:
+    name = token.text.lower()
+    if token.data is not None or name not in _REGISTER_CODES:
+        raise ByteForgeError(token.location, message)
+    return Register(name, _REGISTER_CODES[name], 64, token.location)
+
+
 def _instruction(head: _Token, operands: list[_Token], end: SourceLocation) -> Instruction:
     mnemonic = head.text.lower()
-    expected = 2 if mnemonic == "mov" else 0
+    expected = 0 if mnemonic == "syscall" else 2
     if len(operands) < expected:
-        raise ByteForgeError(end, "MOV requires two operands")
+        raise ByteForgeError(end, f"{mnemonic.upper()} requires two operands")
     if len(operands) > expected:
         raise ByteForgeError(operands[expected].location, f"Extra operand for {mnemonic.upper()}")
     if mnemonic == "syscall":
         return Instruction(mnemonic, (), head.location)
     destination, source = operands
-    name = destination.text.lower()
-    if destination.data is not None or name not in _REGISTER_CODES:
-        raise ByteForgeError(destination.location, "MOV destination must be a supported 64-bit register")
-    register = Register(name, _REGISTER_CODES[name], 64, destination.location)
+    register = _register(destination, f"{mnemonic.upper()} destination must be a supported 64-bit register")
+    if mnemonic in ("add", "sub", "cmp"):
+        value = Immediate(_integer(source), source.location)
+        return Instruction(mnemonic, (register, value), head.location)
+    if mnemonic == "xor":
+        value = _register(source, "XOR source must be a supported 64-bit register")
+        return Instruction(mnemonic, (register, value), head.location)
     source_name = source.text.lower()
     if source.data is not None:
         raise ByteForgeError(source.location, "MOV source must be an integer or symbol")
@@ -137,7 +147,7 @@ def _instruction(head: _Token, operands: list[_Token], end: SourceLocation) -> I
 
 
 def parse(source: str, filename: str) -> Program:
-    """Parse MOV, SYSCALL, labels and DB; preserve unresolved references."""
+    """Parse supported instructions, labels and DB; preserve unresolved references."""
     statements: list[Instruction | Label | DataDirective] = []
     # Only CR/LF terminate lines; other characters remain in the source text.
     lines = source.replace("\r\n", "\n").replace("\r", "\n").split("\n")
@@ -158,7 +168,7 @@ def parse(source: str, filename: str) -> Program:
                 raise ByteForgeError(token.location, "Malformed label or multiple labels on one line")
         head = tokens[0]
         mnemonic = head.text.lower()
-        if head.data is not None or mnemonic not in ("mov", "syscall", "db"):
+        if head.data is not None or mnemonic not in ("mov", "syscall", "add", "sub", "cmp", "xor", "db"):
             raise ByteForgeError(head.location, f"Unknown instruction: {head.text}")
         # Missing input is indicated immediately after the last syntactic token,
         # before any trailing whitespace or comment.

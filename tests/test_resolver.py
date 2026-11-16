@@ -13,6 +13,50 @@ EXIT_SOURCE = "_start:\nmov rax, 60\nmov rdi, 7\nsyscall"
 
 
 class ResolverTests(unittest.TestCase):
+    def test_arithmetic_layout_and_exact_bytes(self):
+        source = ("_start:\nxor rdi, rdi\nadd rdi, 10\nsub rdi, 3\n"
+                  "cmp rdi, 7\nmov rax, 60\nsyscall")
+        result = assemble(parse(source, "arithmetic.asm"), 0x401000)
+        self.assertEqual(result.code, bytes.fromhex(
+            "48 31 FF 48 81 C7 0A 00 00 00 48 81 EF 03 00 00 00 "
+            "48 81 FF 07 00 00 00 48 B8 3C 00 00 00 00 00 00 00 0F 05"
+        ))
+        self.assertEqual(len(result.code), 36)
+        self.assertEqual([item.address for item in result.items],
+                         [0x401000, 0x401003, 0x40100A, 0x401011, 0x401018, 0x401022])
+        self.assertEqual([len(item.data) for item in result.items], [3, 7, 7, 7, 10, 2])
+        self.assertEqual(result.symbols, {"_start": 0x401000})
+        self.assertEqual(result.data, b"")
+
+    def test_arithmetic_before_symbolic_mov_and_data(self):
+        source = '_start: add rax, -1\nxor rcx, rdx\nmov rsi, msg\nsyscall\nmsg: db "x"'
+        result = assemble(parse(source, "a.asm"), 0x401000)
+        self.assertEqual(result.symbols["msg"], 0x401016)
+        self.assertEqual(len(result.code), 22)
+        self.assertEqual(result.data, b"x")
+        self.assertEqual(result.items[2].data, bytes.fromhex("48 BE 16 10 40 00 00 00 00 00"))
+        self.assertEqual(result.items[2].resolution, {"msg": 0x401016})
+
+    def test_arithmetic_range_error_retains_operand_location(self):
+        program = parse("_start: add rax, 2147483648", "a.asm")
+        with self.assertRaises(ByteForgeError) as caught:
+            assemble(program, 0x401000)
+        self.assertIn("signed 32-bit", caught.exception.message)
+        self.assertEqual(caught.exception.location, program.statements[1].operands[1].location)
+
+    def test_arithmetic_cannot_follow_data(self):
+        for instruction in ("add rax, 1", "sub rax, 1", "cmp rax, 0", "xor rax, rbx"):
+            with self.subTest(instruction=instruction):
+                program = parse('_start: syscall\ndb ""\n' + instruction, "a.asm")
+                with self.assertRaisesRegex(ByteForgeError, "cannot follow a DB"):
+                    assemble(program, 0x401000)
+
+    def test_arithmetic_size_mismatch_is_detected(self):
+        program = parse("_start: add rax, 1", "a.asm")
+        with patch("byteforge.resolver.encode", return_value=b"\x48\x81\xc0"):
+            with self.assertRaisesRegex(ByteForgeError, "size mismatch"):
+                assemble(program, 0x401000)
+
     def test_exit_code_and_layout(self):
         program = parse(EXIT_SOURCE, "exit.asm")
         result = assemble(program, 0x401000)

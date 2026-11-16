@@ -19,17 +19,18 @@ source.asm -> parser -> symbol/layout passes -> x86-64 encoder
                                     -> JSON report -> HTML visualizer
 ```
 
-Milestone 5A implements source parsing, two-pass code/data layout, label
-collection, MOV-immediate/symbol and SYSCALL encoding, ELF generation and a CLI.
+Stage 5B.1 implements source parsing, two-pass code/data layout, label
+collection, MOV-immediate/symbol, fixed-imm32 ADD/SUB/CMP, register XOR,
+SYSCALL encoding, ELF generation and a CLI.
 A case-sensitive `_start` label must identify an instruction. DB bytes follow
 instructions; any instruction after the first DB (even `db ""`) is rejected.
-Arithmetic, branches, reports and visualization remain planned.
+Branches, reports and visualization remain planned.
 
 The HTML/CSS/JavaScript visualizer will display source instructions, virtual
 addresses, encoded bytes, resolved symbols, and the generated ELF layout. It
 is a build-time explanation tool, not a CPU emulator.
 
-## Usage (Milestone 5A)
+## Usage (Stage 5B.1)
 
 Python 3.10 or newer is required to build files; no packages are needed.
 From the repository root:
@@ -37,6 +38,7 @@ From the repository root:
 ```bash
 python -m byteforge.cli examples/exit.asm -o build/exit
 python -m byteforge.cli examples/hello.asm -o build/hello
+python -m byteforge.cli examples/arithmetic.asm -o build/arithmetic
 ```
 
 The CLI creates missing output directories and refuses to overwrite an
@@ -82,6 +84,33 @@ MOV uses unsigned 64-bit virtual addresses. Both encodings are always 10 bytes.
 Strings are ASCII with the documented escape set. Data has no implicit NUL
 terminator, and syscall byte counts remain literal values in source.
 
+The arithmetic example computes exit status 7 without using branches:
+
+```asm
+_start:
+    xor rdi, rdi
+    add rdi, 10
+    sub rdi, 3
+    cmp rdi, 7
+    mov rax, 60
+    syscall
+```
+
+Its ELF is 4132 bytes, with 36 code bytes and entry `0x401000`. On Linux x86-64:
+
+```bash
+chmod +x build/arithmetic
+./build/arithmetic
+echo $?                 # expected: 7
+```
+
+ADD, SUB and CMP accept only a base 64-bit register and a signed 32-bit integer
+(`-2147483648..2147483647`). They always use seven-byte `48 81` encodings;
+the CPU sign-extends the immediate, and there is no imm8 optimization.
+XOR accepts two base registers and uses three-byte `48 31` encoding, with
+the first operand as destination. Other arithmetic forms, memory operands,
+extended registers, JMP, JE and JNE remain unsupported. CMP affects flags only.
+
 Windows can generate the same ELF file but cannot execute it directly. Copy
 it to Linux/WSL and apply executable permissions there if necessary. The CLI
 only builds files; it never runs generated programs.
@@ -96,16 +125,19 @@ Focused checks for this milestone:
 
 ```bash
 python -m unittest discover -s tests -p test_resolver.py
+python -m unittest discover -s tests -p test_parser.py
 python -m unittest discover -s tests -p test_encoder.py
 python -m unittest discover -s tests -p test_elf.py
 python -m unittest discover -s tests -p test_integration.py
 ```
 
 Structural and CLI tests run on Windows and Linux. Native tests execute only
-the fixed exit-status-7 and Hello World fixtures, with timeouts, on Linux
+the fixed exit-status-7, Hello World and arithmetic fixtures, with timeouts, on Linux
 x86-64. They are explicitly skipped elsewhere; a skip does not verify native
 execution. The Hello World test checks exact stdout `b"Hello, World!\n"`
 and return code 0; the original native exit test still checks return code 7.
+The arithmetic native test checks return code 7. Regression tests pin complete
+Hello World and exit ELF hashes captured before the arithmetic changes.
 
 Optional development-only Linux checks:
 
@@ -130,4 +162,4 @@ expressions, full x86-64 coverage, CPU emulation, KVM integration, or external
 assembler/linker invocation. Linux x86-64 is the only execution target.
 The current assembler does not prove that arbitrary instruction sequences
 terminate or use Linux syscalls correctly. Writable data, computed expressions,
-arithmetic, branches and the visualizer remain deferred.
+additional arithmetic forms, branches and the visualizer remain deferred.

@@ -144,9 +144,76 @@ class ParserTests(unittest.TestCase):
                                  SourceLocation("a.asm", 2, 3, "  syscall"))
 
     def test_unknown_instructions(self):
-        for source in ("nop", "add rax, 1", "jmp loop"):
+        for source in ("nop", "jmp loop", "je loop", "jne loop"):
             with self.subTest(source=source):
                 self.assert_invalid(source, "Unknown instruction", 1)
+
+    def test_arithmetic_register_and_immediate_operands(self):
+        for mnemonic in ("add", "sub", "cmp"):
+            for code, name in enumerate(("rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi")):
+                with self.subTest(mnemonic=mnemonic, register=name):
+                    instruction = self.instruction(f"{mnemonic} {name}, -5")
+                    self.assertEqual(instruction.mnemonic, mnemonic)
+                    self.assertEqual((instruction.operands[0].name, instruction.operands[0].code,
+                                      instruction.operands[0].width), (name, code, 64))
+                    self.assertIsInstance(instruction.operands[1], Immediate)
+                    self.assertEqual(instruction.operands[1].value, -5)
+
+    def test_arithmetic_literal_formats_and_range_deferred_to_encoder(self):
+        for literal, value in (("0", 0), ("+12", 12), ("-0x10", -16),
+                               ("0X7fffffff", 2147483647), ("2147483648", 2147483648)):
+            with self.subTest(literal=literal):
+                self.assertEqual(self.instruction(f"add rax, {literal}").operands[1].value, value)
+
+    def test_xor_parses_all_register_pairs(self):
+        registers = ("rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi")
+        for destination in registers:
+            for source in registers:
+                with self.subTest(destination=destination, source=source):
+                    instruction = self.instruction(f"xor {destination}, {source}")
+                    self.assertEqual(instruction.mnemonic, "xor")
+                    self.assertEqual([operand.name for operand in instruction.operands], [destination, source])
+                    self.assertTrue(all(isinstance(operand, Register) for operand in instruction.operands))
+
+    def test_arithmetic_preserves_case_normalization_and_locations(self):
+        line = "\tHere: AdD RDI, -0x10 ; keep original  "
+        label, instruction = parse("\n" + line, "arithmetic.asm").statements
+        self.assertEqual(label.name, "Here")
+        self.assertEqual(instruction.mnemonic, "add")
+        self.assertEqual(instruction.operands[0].name, "rdi")
+        for item, column in ((label, 2), (instruction, 8),
+                             (instruction.operands[0], 12), (instruction.operands[1], 17)):
+            self.assertEqual(item.location, SourceLocation("arithmetic.asm", 2, column, line))
+        self.assertEqual(self.instruction("XoR RAX, RBX").operands[1].name, "rbx")
+
+    def test_arithmetic_rejects_noninteger_sources(self):
+        for mnemonic in ("add", "sub", "cmp"):
+            for operand in ("msg", "rbx", "eax", "r8", "[rax]", '"x"', "0xGG"):
+                with self.subTest(mnemonic=mnemonic, operand=operand):
+                    self.assert_invalid(f"{mnemonic} rax, {operand}", "Invalid integer literal", 10)
+
+    def test_xor_rejects_nonregister_sources(self):
+        for operand in ("1", "-1", "msg", "eax", "r8", "[rax]", '"x"'):
+            with self.subTest(operand=operand):
+                self.assert_invalid(f"xor rax, {operand}", "source must be a supported 64-bit register", 10)
+
+    def test_arithmetic_rejects_invalid_destinations(self):
+        for mnemonic in ("add", "sub", "cmp", "xor"):
+            for destination in ("eax", "r8", "raq", "1", "[rax]"):
+                with self.subTest(mnemonic=mnemonic, destination=destination):
+                    source = "rax" if mnemonic == "xor" else "1"
+                    self.assert_invalid(f"{mnemonic} {destination}, {source}",
+                                        "destination must be a supported 64-bit register", 5)
+
+    def test_arithmetic_operand_counts_and_separators(self):
+        for mnemonic in ("add", "sub", "cmp", "xor"):
+            with self.subTest(mnemonic=mnemonic):
+                self.assert_invalid(mnemonic, "two operands", 4)
+                self.assert_invalid(f"{mnemonic} rax", "two operands", 8)
+                self.assert_invalid(f"{mnemonic} rax,", "Missing operand", 9)
+                self.assert_invalid(f"{mnemonic} , 1", "Missing operand", 5)
+                self.assert_invalid(f"{mnemonic} rax 1", "Expected comma", 9)
+                self.assert_invalid(f"{mnemonic} rax, 1, 2", "Extra operand", 13)
 
     def test_invalid_destination_registers(self):
         for name in ("eax", "r8", "raq", "R15D", "1", "[rax]"):
