@@ -466,6 +466,62 @@ class TraceServerTests(unittest.TestCase):
         self.assertIn("http://127.0.0.1:", output.getvalue())
         self.assertIn("SIMULATED execution only", output.getvalue())
 
+    def test_frontend_static_routes_have_exact_content_and_mime(self):
+        for route, filename, mime in (("/", "index.html", "text/html"),
+                                     ("/index.html", "index.html", "text/html"),
+                                     ("/styles.css", "styles.css", "text/css"),
+                                     ("/app.js", "app.js", "text/javascript"),
+                                     ("/panels.js", "panels.js", "text/javascript")):
+            with self.subTest(route=route):
+                status, data, headers = self.request("GET", route)
+                self.assertEqual(status, 200)
+                self.assertEqual(data, (ROOT / "visualizer" / filename).read_bytes())
+                self.assertTrue(headers["Content-Type"].startswith(mime))
+                self.assertNotIn("Content-Disposition", headers)
+                self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+                self.assertIn("script-src 'self'", headers["Content-Security-Policy"])
+                self.assertNotIn("unsafe-inline", headers["Content-Security-Policy"])
+
+    def test_static_assets_are_preloaded_and_guarded(self):
+        with patch("pathlib.Path.open") as opened, patch("builtins.open") as files:
+            self.assertEqual(self.request("GET", "/")[0], 200)
+            self.assertEqual(self.request("GET", "/app.js")[0], 200)
+        opened.assert_not_called()
+        files.assert_not_called()
+        self.assertEqual(self.request("GET", "/", headers={"Host": "evil.example"})[0], 403)
+        self.assertEqual(self.request("GET", "/app.js", headers={"Origin": "http://evil.example"})[0], 403)
+        self.assertEqual(self.request("POST", "/app.js", {})[0], 405)
+        self.assertEqual(self.request("POST", "/app.js", {}, headers={"X-ByteForge-Token": None})[0], 403)
+
+    def test_static_allowlist_rejects_traversal_directories_and_extra_paths(self):
+        for route in ("/visualizer/", "/visualizer/index.html", "/README.md", "/trace_server.py",
+                      "/../AGENTS.md", "/%2e%2e/AGENTS.md", "/app.js/../README.md", "/favicon.ico"):
+            with self.subTest(route=route):
+                self.assertEqual(self.request("GET", route)[0], 404)
+        self.assertEqual(self.request("GET", "/app.js?path=../AGENTS.md")[0], 400)
+
+    def test_frontend_uses_local_modules_and_safe_rendering(self):
+        from html.parser import HTMLParser
+        class Assets(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.sources = []
+                self.handlers = []
+            def handle_starttag(self, tag, attrs):
+                for name, value in attrs:
+                    if name in ("src", "href"):
+                        self.sources.append(value)
+                    if name.startswith("on"):
+                        self.handlers.append(name)
+        parser = Assets()
+        parser.feed((ROOT / "visualizer" / "index.html").read_text(encoding="utf-8"))
+        self.assertTrue(all(value.startswith(("/", "#")) for value in parser.sources))
+        self.assertFalse(parser.handlers)
+        for name in ("app.js", "panels.js"):
+            script = (ROOT / "visualizer" / name).read_text(encoding="utf-8")
+            self.assertNotIn(".innerHTML", script)
+            self.assertNotIn("insertAdjacentHTML", script)
+
 
 if __name__ == "__main__":
     unittest.main()

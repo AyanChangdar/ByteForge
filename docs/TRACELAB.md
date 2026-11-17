@@ -1,4 +1,4 @@
-# ByteForge TraceLab: Stage 6B.1
+# ByteForge TraceLab: Stage 6B.2
 
 TraceLab is a bounded educational simulator of ByteForge's existing typed
 instruction forms. The real assembler remains the source of machine-code
@@ -265,8 +265,9 @@ addresses/bytes. Its following syscall now records simulated exit status 7.
 All five existing examples are also compared against the original assembler
 pipeline for byte-identical ELF images; native tests retain platform skips.
 
-Stage 6B.1 adds the local HTTP and JSON adapters described below. Browser/UI
-work and byte explanations remain deferred. No native execution or full
+Stage 6B.1 adds the local HTTP and JSON adapters described below; Stage 6B.2
+adds the browser Playground over those unchanged APIs. Byte-field explanations
+and the advanced ELF explorer remain deferred. No native execution or full
 CPU/OS emulation is added.
 
 ## Local HTTP API (Stage 6B.1)
@@ -277,7 +278,8 @@ python -m byteforge.trace_server --port 8765
 
 This works from the repository root on Windows or Linux/WSL. The server binds
 only IPv4 `127.0.0.1`, prints its local URL and exits on Ctrl+C. There is no
-host option, frontend, repository file server or browser launch. Tests use
+host option, repository file server or automatic browser launch. Open the
+printed URL for the Playground. Tests use
 ephemeral loopback ports and close their servers. This is a local development
 tool, not a public service.
 
@@ -323,7 +325,7 @@ is returned by successful assembly; clients retain it alongside its session ID.
 
 Context query parameters are required on timeline/memory/ELF to prevent stale
 tabs from reading a replacement session's artifact. Unknown/duplicate fields
-are rejected. There are no extra routes or static assets. Known routes with
+are rejected. Stage 6B.2 adds only the five static URLs documented below. API routes with
 wrong methods return 405; unknown routes return 404 and unknown HTTP verbs
 return 501. Errors are JSON, including these method/route errors.
 
@@ -390,7 +392,7 @@ Byte lengths, file offsets, history/page indices, revisions, exit status and
 small ELF fields are bounded ordinary JSON integers. ZF and branch decisions
 are booleans; non-branch decisions/targets are null. `stdout.hex` is lossless
 even for NUL/non-UTF-8 bytes; display escapes controls rather than sending raw
-terminal controls. A future frontend must render source/display with
+terminal controls. The frontend renders source/display with
 `textContent`, never interpret them as HTML.
 
 The assembly report includes `source`, `source_lines`, `statement_locations`,
@@ -462,8 +464,102 @@ return a generic 500 without exception paths or traceback text.
 
 The token is not authentication against other local processes. Single-request
 serialization means a slow client can delay other clients until its short
-deadline. No public deployment, TLS, multi-user workspaces, frontend/static
+deadline. No public deployment, TLS, multi-user workspaces, arbitrary static
 hosting or hard cancellation of already accepted CPU steps is provided.
+
+## Browser Playground (Stage 6B.2)
+
+The same command serves the site and API:
+
+```bash
+python -m byteforge.trace_server --port 8765
+```
+
+Open `http://127.0.0.1:8765`. Home, Playground, Instruction Set and CLI Guide
+are hash-navigated views of one HTML document. The design follows the approved
+wireframe: dark panels, a roughly 55/45 editor/CPU split, an instruction detail
+strip and tabbed inspectors. Mobile layouts stack panels and retain controls.
+
+Approved frontend files are `visualizer/index.html`, `styles.css`, `app.js`
+and `panels.js`. The server preloads them at startup and serves exactly:
+
+| URL | Content type |
+|---|---|
+| `/`, `/index.html` | `text/html; charset=utf-8` |
+| `/styles.css` | `text/css; charset=utf-8` |
+| `/app.js`, `/panels.js` | `text/javascript; charset=utf-8` |
+
+These routes accept GET only, reject query fields and pass the existing
+Host/Origin checks. API responses and ELF downloads are unchanged. No
+directory listing, path-to-file translation or additional assets are exposed.
+Static responses retain no-store, nosniff and framing protections; their CSP
+allows only same-origin scripts, styles, connections and images. Inline
+scripts/handlers, external fonts, CDNs and build tooling are not used.
+
+### State and interaction
+
+`app.js` owns one workspace context, source version, mutation lock and playback
+timer. It retrieves the token/examples/state from the API, then submits source
+and safe filenames with the actual session ID and revision. On reload, an
+existing backend workspace is not shown as if it belonged to the editor: new
+assembly binds the displayed source to a fresh session.
+
+Only one mutation can be pending. Play requests one `next` transition at a
+time and schedules the following timeout after the mutation and inspector
+refresh finish. Pause cancels future scheduling; an already accepted request
+can still complete. Leaving Playground, changing examples or editing source
+also pauses. No CPU semantics or instruction encoding run in JavaScript.
+
+Every source edit invalidates the binding, clears previous displayed CPU,
+output/inspectors and disables tracing/reset until assembly succeeds. Response
+handlers retain the returned server context but discard their content when
+the editor version changed during a request. This lets the next assembly use
+the correct revision without repainting an obsolete trace onto new source.
+
+HTTP 409 stops playback, invalidates the displayed trace and fetches current
+bootstrap/state. Reassembly is required. Network failures follow the same
+conservative recovery path because the server might already have accepted a
+mutation. The source editor is never overwritten by trace responses.
+
+`panels.js` renders API metadata with text nodes/textContent. Register and RIP
+hex strings remain exact; BigInt is used only for display counters and memory
+address offsets. The next source line comes from the instruction at running
+RIP. The last executed line comes from an executed last step; blocked attempts
+are labeled separately. Back/reset register highlights compare the previous
+displayed state with the restored state. Instruction selection does not step.
+
+Memory inspection and timeline paging call existing bounded read endpoints
+with matching context. CPU/source/output/bytes are updated from one returned
+view and its corresponding assembly metadata. Raw stdout hex is preserved;
+valid printable UTF-8 is displayed as text, while binary/control output uses
+the backend's escaped representation. Neither is inserted as HTML.
+
+The instruction detail strip shows real source, address, file offset, size
+and exact bytes. It does not label opcode fields or calculate rel32. Detailed
+instruction cards, opcode/ModR/M explanations and advanced ELF exploration
+belong to Stage 6C and are not implemented here.
+
+### Browser acceptance checklist
+
+1. Start the server and open Home at its loopback URL.
+2. Open Playground using the primary action or navigation.
+3. Load `loop.asm`; trace controls remain disabled before assembly.
+4. Assemble; confirm real instruction bytes, symbols and zero initial registers.
+5. Step forward; RCX becomes `0x0000000000000003` and the next line advances.
+6. Play; tracing halts with simulated exit status 7.
+7. Reset; confirm initial state, empty output and cleared history.
+8. Step twice, Back, then Forward; confirm saved values/flags/source restore.
+9. Load and assemble Hello World; old trace content must disappear on switching.
+10. Play, then open Output Console; confirm `Hello, World!` and exit status 0.
+11. Edit source; Step/Play/Reset disable immediately, including during a pending request.
+12. Assemble `_start: nop`; confirm a source-located error and working jump link.
+13. Check Home, Instruction Set and CLI Guide links; use arrow keys on inspector tabs.
+14. Check a narrow viewport (390 px); controls remain readable and panels stack.
+
+Also check Pause while a step is pending, instruction selection versus next
+line, binary output's raw-byte view, and a second tab advancing the shared
+workspace. A stale tab must stop and require reassembly. There is one shared
+workspace, not independent per-tab sessions.
 
 ### API validation
 

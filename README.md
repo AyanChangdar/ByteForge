@@ -24,12 +24,13 @@ collection, MOV-immediate/symbol, fixed-imm32 ADD/SUB/CMP, register XOR,
 JMP/JE/JNE rel32 branches, SYSCALL encoding, ELF generation and a CLI.
 A case-sensitive `_start` label must identify an instruction. DB bytes follow
 instructions; any instruction after the first DB (even `db ""`) is rejected.
-Reports and visualization remain planned.
+Structured reports and the browser TraceLab Playground are implemented.
 
-The HTML/CSS/JavaScript visualizer will display source instructions, virtual
-addresses, encoded bytes, resolved symbols, and the generated ELF layout. It
-is planned. Separately, TraceLab Stage 6A.2 now provides bounded educational
-simulation through a terminal debugger; it never executes the generated ELF.
+The HTML/CSS/JavaScript Playground displays source, virtual addresses, actual
+encoded bytes, symbols, read-only DB data and simulated CPU execution. The
+browser and terminal debugger share the same bounded Python trace engine;
+neither runs the generated ELF. Detailed opcode and ELF exploration remain
+deferred to Stage 6C.
 
 ## Usage (Stage 5B.2)
 
@@ -172,17 +173,18 @@ Back restores registers, RIP, flags, halt/exit state and visible output.
 Forward reuses cached history; reset clears history and output. Defaults cap
 source/output at 64 KiB each, instructions at 2,048, executed steps/history
 transitions at 10,000, continue requests at 100 steps and memory inspections
-at 256 bytes. The browser and instruction inspector remain deferred.
+at 256 bytes. The browser is available below; detailed opcode inspection is deferred.
 See [TraceLab contracts](docs/TRACELAB.md) for exact limits and semantics.
 
-## TraceLab local API (Stage 6B.1)
+## TraceLab Playground and local API (Stage 6B.2)
 
 ```bash
 python -m byteforge.trace_server --port 8765
 ```
 
-The API binds only to `http://127.0.0.1:8765`. There is no frontend yet and
-the repository is never served. Stop with Ctrl+C. Python's standard library
+Open **http://127.0.0.1:8765** in your browser. The server binds only to loopback
+and serves four allowlisted visualizer files, never the repository directory.
+Stop with Ctrl+C. Python's standard library
 is sufficient on Windows and Linux/WSL; no generated native binary is run.
 
 Fetch `GET /api/bootstrap` for schema version 1, the process mutation token,
@@ -204,7 +206,27 @@ Host/Origin, POST tokens, existing trace limits, bounded requests/pages and
 short connection deadlines. It does not enable CORS or launch subprocesses.
 This is for local development, not public hosting. See the
 [endpoint schemas and security boundary](docs/TRACELAB.md#local-http-api-stage-6b1)
-before building a client. Stage 6B.2 frontend work remains unimplemented.
+before building another client.
+
+The single-page site has Home, Playground, Instruction Set and CLI Guide.
+Load an example, click Assemble, then Step or Play. Back restores saved state
+and output; Reset clears history. Play never overlaps mutation requests, and
+Pause prevents the next scheduled step (an in-flight step may finish).
+The editor shows the next instruction in teal and the last executed line in
+amber. Selecting a machine-byte row inspects it without changing execution.
+
+Editing source or changing examples clears the old displayed trace and
+requires reassembly. Stale revisions stop playback and refresh server context;
+reassemble to bind the editor again. Source text, bytes, state, output and
+timeline all come from the Python API. Binary stdout retains its exact hex
+alongside a UTF-8 or escaped preview. All rendered source/output is safe text.
+
+Keyboard shortcuts: Ctrl+Enter Assemble, F10 Step, Shift+F10 Back, F9
+Play/Pause. Inspector tabs also support arrow keys, Home and End. The layout
+stacks on small screens. No Node/npm, build step, external font or CDN is used.
+The [browser acceptance checklist](docs/TRACELAB.md#browser-acceptance-checklist)
+documents the main flows. Advanced opcode fields and the ELF explorer remain
+Stage 6C work.
 
 ## Development
 
@@ -259,4 +281,5 @@ expressions, full x86-64 coverage, general-purpose CPU emulation, KVM integratio
 assembler/linker invocation. Linux x86-64 is the only execution target.
 The current assembler does not prove that arbitrary instruction sequences
 terminate or use Linux syscalls correctly. Writable data, computed expressions,
-additional arithmetic forms, other branch forms and the visualizer remain deferred.
+additional arithmetic forms, other branch forms and advanced opcode/ELF
+inspectors remain deferred.

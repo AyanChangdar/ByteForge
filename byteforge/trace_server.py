@@ -27,6 +27,13 @@ EXAMPLE_NAMES = ("exit", "hello", "arithmetic", "loop", "conditional")
 PROCESS_TOKEN = secrets.token_urlsafe(32)
 GET_ROUTES = ("/api/bootstrap", "/api/examples", "/api/state", "/api/timeline", "/api/memory", "/api/elf")
 POST_ROUTES = ("/api/assemble", "/api/trace")
+STATIC_ASSETS = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/index.html": ("index.html", "text/html; charset=utf-8"),
+    "/styles.css": ("styles.css", "text/css; charset=utf-8"),
+    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/panels.js": ("panels.js", "text/javascript; charset=utf-8"),
+}
 
 
 class APIError(Exception):
@@ -85,6 +92,14 @@ class TraceHTTPServer(HTTPServer):
             if len(raw) > 65536:
                 raise ValueError("Allowlisted example exceeds source limit")
             self.examples.append({"name": name, "filename": path.name, "source": raw.decode("utf-8")})
+        # Preload only these exact assets. HTTP paths never become filesystem paths.
+        self.assets = {}
+        asset_dir = Path(__file__).resolve().parents[1] / "visualizer"
+        for route, (name, mime) in STATIC_ASSETS.items():
+            path = asset_dir / name
+            if path.resolve().parent != asset_dir:
+                raise ValueError("Static asset is outside the fixed visualizer directory")
+            self.assets[route] = (path.read_bytes(), mime)
         super().__init__(("127.0.0.1", port), TraceHandler)
         actual_port = self.server_address[1]
         self.authority = "127.0.0.1" if actual_port == 80 else f"127.0.0.1:{actual_port}"
@@ -187,15 +202,15 @@ class TraceHandler(BaseHTTPRequestHandler):
         if time.monotonic() >= self.deadline:
             raise APIError(408, "request", "request_timeout", "Request deadline exceeded")
 
-    def _respond(self, status, payload, *, binary=False):
+    def _respond(self, status, payload, *, binary=False, asset_type=None):
         self.close_connection = True
-        if binary:
+        if binary or asset_type:
             data = payload
         else:
             data = json.dumps({"schema_version": SCHEMA_VERSION, **payload},
                               ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "application/octet-stream" if binary else "application/json; charset=utf-8")
+        self.send_header("Content-Type", asset_type or ("application/octet-stream" if binary else "application/json; charset=utf-8"))
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Connection", "close")
         self.send_header("Cache-Control", "no-store")
@@ -203,7 +218,10 @@ class TraceHandler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+        policy = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+        if asset_type:
+            policy += "; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; form-action 'none'"
+        self.send_header("Content-Security-Policy", policy)
         if binary:
             self.send_header("Content-Disposition", 'attachment; filename="byteforge.elf"')
         self.end_headers()
@@ -382,6 +400,15 @@ class TraceHandler(BaseHTTPRequestHandler):
             if any(len(items) != 1 for items in values.values()):
                 raise APIError(400, "request", "invalid_query", "Duplicate query fields")
             query = {name: items[0] for name, items in values.items()}
+            if parsed.path in self.server.assets:
+                _fields(query, ())
+                if self.command != "GET":
+                    raise APIError(405, "request", "method_not_allowed", "Static assets support GET only")
+                if self.headers.get_all("Content-Length", []) not in ([], ["0"]):
+                    raise APIError(400, "request", "unexpected_body", "GET requests must not have a body")
+                data, mime = self.server.assets[parsed.path]
+                self._respond(200, data, asset_type=mime)
+                return
             if parsed.path not in (*GET_ROUTES, *POST_ROUTES):
                 raise APIError(404, "request", "not_found", "Unknown API route")
             if ((self.command == "GET" and parsed.path not in GET_ROUTES)
@@ -417,7 +444,7 @@ class TraceHandler(BaseHTTPRequestHandler):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="ByteForge TraceLab local API (no frontend yet)")
+    parser = argparse.ArgumentParser(description="ByteForge TraceLab local Playground and API")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(argv)
     try:
