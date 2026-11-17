@@ -172,8 +172,39 @@ Back restores registers, RIP, flags, halt/exit state and visible output.
 Forward reuses cached history; reset clears history and output. Defaults cap
 source/output at 64 KiB each, instructions at 2,048, executed steps/history
 transitions at 10,000, continue requests at 100 steps and memory inspections
-at 256 bytes. The browser, HTTP API and instruction inspector remain deferred.
+at 256 bytes. The browser and instruction inspector remain deferred.
 See [TraceLab contracts](docs/TRACELAB.md) for exact limits and semantics.
+
+## TraceLab local API (Stage 6B.1)
+
+```bash
+python -m byteforge.trace_server --port 8765
+```
+
+The API binds only to `http://127.0.0.1:8765`. There is no frontend yet and
+the repository is never served. Stop with Ctrl+C. Python's standard library
+is sufficient on Windows and Linux/WSL; no generated native binary is run.
+
+Fetch `GET /api/bootstrap` for schema version 1, the process mutation token,
+limits and current session/revision. Send `X-ByteForge-Token` and JSON bodies
+on POSTs. Initial `POST /api/assemble` accepts source, a display filename,
+`session_id: null` and `revision: 0`. Subsequent assembly/trace requests must
+send the current session ID and revision; stale requests return 409.
+
+Available routes are `GET /api/bootstrap`, `GET /api/examples`,
+`POST /api/assemble`, `POST /api/trace`, `GET /api/state`, `GET /api/timeline`,
+`GET /api/memory`, and `GET /api/elf`. Trace supports next/back/reset/bounded
+continue over the same engine as the terminal debugger. Timeline, DB memory
+and ELF reads require current session/revision query parameters. ELF is an
+optional download only. Source/bytes/output remain data, never executed HTML.
+
+Machine values and addresses use exact hex strings; binary output includes
+lossless hex and an escaped display string. The server enforces exact local
+Host/Origin, POST tokens, existing trace limits, bounded requests/pages and
+short connection deadlines. It does not enable CORS or launch subprocesses.
+This is for local development, not public hosting. See the
+[endpoint schemas and security boundary](docs/TRACELAB.md#local-http-api-stage-6b1)
+before building a client. Stage 6B.2 frontend work remains unimplemented.
 
 ## Development
 
@@ -191,6 +222,8 @@ python -m unittest discover -s tests -p test_elf.py
 python -m unittest discover -s tests -p test_integration.py
 python -m unittest discover -s tests -p test_trace.py
 python -m unittest discover -s tests -p test_trace_cli.py
+python -m unittest discover -s tests -p test_report.py
+python -m unittest discover -s tests -p test_trace_server.py
 ```
 
 Structural and CLI tests run on Windows and Linux. Native tests execute only

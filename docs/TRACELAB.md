@@ -1,4 +1,4 @@
-# ByteForge TraceLab: Stage 6A.2
+# ByteForge TraceLab: Stage 6B.1
 
 TraceLab is a bounded educational simulator of ByteForge's existing typed
 instruction forms. The real assembler remains the source of machine-code
@@ -54,7 +54,7 @@ in `byteforge/trace_model.py`, independently of the assembler's shared models.
 The register mapping contains exactly `rax`, `rcx`, `rdx`, `rbx`, `rsp`, `rbp`,
 `rsi`, `rdi`. Values, RIP and the step count must be integers in `0..2^64-1`;
 booleans are not accepted as integers. ZF is a boolean. Python integers retain
-all 64 bits exactly. No JSON serialization is introduced in this stage.
+all 64 bits exactly. The Stage 6B.1 adapter below serializes them losslessly.
 
 Registers are defensively copied into read-only mappings. Each step creates a
 new state; it never changes the input or earlier results. `changed_registers`
@@ -265,5 +265,215 @@ addresses/bytes. Its following syscall now records simulated exit status 7.
 All five existing examples are also compared against the original assembler
 pipeline for byte-identical ELF images; native tests retain platform skips.
 
-Deferred: HTTP server, browser/frontend, JSON serialization and byte
-explanations. No native execution or full CPU/OS emulation is added.
+Stage 6B.1 adds the local HTTP and JSON adapters described below. Browser/UI
+work and byte explanations remain deferred. No native execution or full
+CPU/OS emulation is added.
+
+## Local HTTP API (Stage 6B.1)
+
+```bash
+python -m byteforge.trace_server --port 8765
+```
+
+This works from the repository root on Windows or Linux/WSL. The server binds
+only IPv4 `127.0.0.1`, prints its local URL and exits on Ctrl+C. There is no
+host option, frontend, repository file server or browser launch. Tests use
+ephemeral loopback ports and close their servers. This is a local development
+tool, not a public service.
+
+### Transport and workspace contract
+
+Every JSON response has `schema_version: 1` and `ok: true|false`. Successful
+workspace responses include `session_id`, numeric `revision`, and `view`.
+Before assembly these are `null`, `0`, and a `not_assembled` view with null CPU
+and stdout. Revisions are monotonic across assembly replacement and trace
+requests; a new successful assembly generates a fresh opaque session ID.
+Clients must treat revisions as request preconditions, not execution counts.
+
+Fetch `/api/bootstrap` to obtain `mutation_token`, current session ID/revision,
+the seven existing `TraceLimits`, HTTP limits and supported capabilities.
+Send the token as `X-ByteForge-Token` on every POST. Token lifetime is the Python
+server process lifetime. Use `Content-Type: application/json` and an exact
+Content-Length; compressed or chunked requests are unsupported.
+
+Both assembly and trace POSTs require the currently observed `session_id` and
+`revision`. First assembly uses `null` and `0`. Stale preconditions return 409
+without mutation. Missing/malformed fields return 400. All requests are
+serialized by one `HTTPServer` request loop; no worker mutates state in parallel.
+
+Successful trace requests increment the revision even for no-ops, such as back
+at the initial state or next after exit. Successful assembly replaces the old
+session and clears timeline metadata. Invalid assembly leaves the previous
+workspace and revision intact. After a network failure, fetch `/api/state` to
+resynchronize rather than blindly retrying the old revision. Assembly metadata
+is returned by successful assembly; clients retain it alongside its session ID.
+
+### Routes
+
+| Method and route | Request | Response fields beyond schema/ok |
+|---|---|---|
+| GET `/api/bootstrap` | no query | `mutation_token`, `session_id`, `revision`, `limits`, `http_limits`, `capabilities` |
+| GET `/api/examples` | no query | `examples: [{name, filename, source}]` |
+| POST `/api/assemble` | `{source, filename?, session_id, revision}` | workspace plus `assembly` report |
+| POST `/api/trace` | `{operation, count?, session_id, revision}` | workspace plus `transition` (nullable step) |
+| GET `/api/state` | no query | current workspace |
+| GET `/api/timeline` | `session_id`, `revision`, optional `offset=0`, `limit=50` | context, `cursor`, `total`, `offset`, `events`, `next_offset` |
+| GET `/api/memory` | context plus hex `address`, optional `length=16` | context plus `memory` |
+| GET `/api/elf` | `session_id`, `revision` | exact current ELF bytes as an attachment, not JSON |
+
+Context query parameters are required on timeline/memory/ELF to prevent stale
+tabs from reading a replacement session's artifact. Unknown/duplicate fields
+are rejected. There are no extra routes or static assets. Known routes with
+wrong methods return 405; unknown routes return 404 and unknown HTTP verbs
+return 501. Errors are JSON, including these method/route errors.
+
+Example initial assembly request body:
+
+```json
+{
+  "source": "_start: mov rax, 60\nmov rdi, 7\nsyscall",
+  "filename": "exit.asm",
+  "session_id": null,
+  "revision": 0
+}
+```
+
+`filename` is a display name only: at most 64 ASCII characters, starting with
+an alphanumeric character, followed by letters/digits/underscore/dot/hyphen,
+ending in `.asm`, and containing no `..`. It is never opened or written.
+Missing filename defaults to `input.asm`. Source must be valid Unicode and
+meet the existing UTF-8 byte/instruction limits.
+
+Trace operations are `next`, `back`, `reset` and `continue`. Only continue
+accepts `count`, a positive integer at most `max_continue_steps`; its default
+is that limit. The controller calls the existing public `TraceSession.next()`
+in a bounded loop. It records returned immutable transitions only when history
+grows, without accessing private engine fields. Back/forward therefore retain
+cached event identity; reset clears both engine history and event references.
+CPU simulation remains entirely in the original trace engine.
+
+Timeline pages contain `{index, visible, step}` events. Indices are zero-based;
+`visible` means index < cursor. Recorded future events remain available after
+back, matching cached forward playback. Pages are limited to 100 events.
+`next_offset` is null at the end. Memory reads are limited to 256 bytes and
+use the existing read-only DB inspection API, including its zero-length rule.
+ELF downloads use `application/octet-stream` and fixed attachment filename
+`byteforge.elf`; the server never executes or automatically saves them.
+
+### Serialization schemas
+
+`byteforge/report.py` is pure and independent of HTTP and HTML. The documented
+three-argument `build_report(program, result, elf_layout)` interface is retained.
+`assembly_report(trace_program)` extends it using the original source and
+actual ELF header bytes. No parser, encoder or decoder is duplicated.
+
+| Object | Fields and representation |
+|---|---|
+| Source location | `{filename, line, column, text}` or null; original text, 1-based positions |
+| Bytes | `{hex, display, length}`; uppercase space-separated hex, escaped ASCII display, byte count |
+| CPU | `registers`, `rip`, `zf`, `step_count`, `status`, `halt_reason`, `stdout_size`, `exit_status` |
+| View | `execution_status`, `cpu`, `stdout`, `cursor`, `history_size`, `last_step` |
+| Step | location, `address`, `bytes_hex`, `size`, `before`, `after`, `changed_registers`, `branch_taken`, `branch_target`, `executed`, `output`, `fault` |
+| Instruction | address, file offset, size, actual bytes, mnemonic, operands, source location and symbol-resolution mapping |
+| Symbol | `{name, address, file_offset}` sorted by name |
+| Memory | `{address, file_offset, data, read_only: true}` |
+| Error | `{phase, code, message, location}` |
+
+All registers, virtual addresses, CPU step counts and stdout-size counters are
+fixed-width `0x` + 16 lowercase hex digits. Symbol/branch targets and ELF entry,
+segment virtual/physical addresses use the same representation. Immediate
+operands include exact signed decimal `value` text plus hexadecimal `bits`.
+Registers also retain name/code/width; symbol operands retain spelling.
+No machine integer relies on JavaScript floating-point precision.
+
+Byte lengths, file offsets, history/page indices, revisions, exit status and
+small ELF fields are bounded ordinary JSON integers. ZF and branch decisions
+are booleans; non-branch decisions/targets are null. `stdout.hex` is lossless
+even for NUL/non-UTF-8 bytes; display escapes controls rather than sending raw
+terminal controls. A future frontend must render source/display with
+`textContent`, never interpret them as HTML.
+
+The assembly report includes `source`, `source_lines`, `statement_locations`,
+`code_base`, `data_base`, `code_size`, `data_size`, DB `data`, `instructions`,
+`symbols`, and `elf`. ELF metadata includes entry, total size, actual program
+segments, unpacked header fields and five regions: ELF header, program
+headers, padding, code and data. Each region has a file offset, virtual address
+and size. Instruction bytes come directly from `EncodedItem.data`; source and
+symbols come from existing parsed/assembled models. File offsets use the real
+segment mapping, not the entry address.
+
+Execution statuses distinguish `not_assembled`, `ready`, `running`,
+`halted_successfully`, `unsupported_operation`, `faulted`, and
+`step_limit_reached`. Output/history limits retain their explicit CPU halt
+reason under `faulted`. A valid trace request that encounters a simulated
+fault returns HTTP 200 with the fault in its transition/view; malformed
+requests return HTTP errors. Last-step register changes describe that saved
+transition; consumers can compare states for their own back/reset highlights.
+
+An invalid instruction response is, for example:
+
+```json
+{
+  "schema_version": 1,
+  "ok": false,
+  "error": {
+    "phase": "assembly",
+    "code": "assembly_error",
+    "message": "Unknown instruction: nop",
+    "location": {
+      "filename": "input.asm",
+      "line": 1,
+      "column": 9,
+      "text": "_start: nop"
+    }
+  }
+}
+```
+
+Phases are request, security, session, assembly, trace, memory and server.
+Stale context is `409 / session / stale_workspace`. Before assembly, trace
+and artifact reads return `409 / session / not_assembled`. Internal errors
+return a generic 500 without exception paths or traceback text.
+
+### Local security and resource boundary
+
+- Exact loopback Host/port is required. If Origin is present it must exactly
+  match the server URL; missing Origin permits terminal clients. Duplicate
+  Host/Origin/token headers are rejected. Cross-site browser requests are
+  rejected, and permissive CORS is never enabled.
+- POST tokens, strict JSON object parsing, duplicate-key rejection, session
+  preconditions and fixed route/example allowlists protect state changes.
+- Body limit: 512 KiB (allowing JSON escapes around 64 KiB of source). Header
+  block limit: 16 KiB; request-line limit: 2,048 bytes. GET bodies, chunking,
+  compressed bodies and arbitrary uploads are unsupported.
+- Each accepted connection has a three-second absolute deadline, socket
+  timeout and connection shutdown timer, including slow headers/body reads.
+  Assembly checks the deadline before workspace replacement. CPU work is
+  bounded by source/instruction/continue limits; this is not hard CPU
+  preemption of Python internals. A timeout may close the connection without
+  delivering JSON. A response failure does not undo an accepted mutation.
+- Existing source, instruction, step, history and output limits are unchanged.
+  The server never invokes a subprocess, shell or native ELF. Examples are
+  read only from the five fixed repository examples at startup; requests
+  perform no filesystem reads or writes.
+- Responses include no-store, nosniff, DENY framing, same-origin resource
+  policy and restrictive CSP headers. Access logging is disabled; source,
+  URLs and tokens are not logged by default.
+
+The token is not authentication against other local processes. Single-request
+serialization means a slow client can delay other clients until its short
+deadline. No public deployment, TLS, multi-user workspaces, frontend/static
+hosting or hard cancellation of already accepted CPU steps is provided.
+
+### API validation
+
+```bash
+python -B -m unittest discover -s tests -p test_report.py
+python -B -m unittest discover -s tests -p test_trace_server.py
+python -B -m unittest discover -s tests
+git diff --check
+```
+
+Tests use actual loopback connections on ephemeral ports, bounded request
+timeouts, clean server shutdown, concurrent revision conflicts, known example
+fixtures and real assembler/trace metadata. They never execute generated ELF.
