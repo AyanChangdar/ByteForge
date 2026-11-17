@@ -23,10 +23,16 @@ class TraceLimits:
     max_source_bytes: int = 65536
     max_instructions: int = 2048
     max_steps: int = 10000
+    max_output_bytes: int = 65536
+    max_history: int = 10000
+    max_continue_steps: int = 100
+    max_memory_bytes: int = 256
 
     def __post_init__(self) -> None:
         for name, maximum in (("max_source_bytes", 65536), ("max_instructions", 2048),
-                              ("max_steps", 10000)):
+                              ("max_steps", 10000), ("max_output_bytes", 65536),
+                              ("max_history", 10000), ("max_continue_steps", 100),
+                              ("max_memory_bytes", 256)):
             value = getattr(self, name)
             if type(value) is not int or not 1 <= value <= maximum:
                 raise ValueError(f"{name} must be an integer in 1..{maximum}")
@@ -40,16 +46,21 @@ class CPUState:
     step_count: int = 0
     status: TraceStatus = TraceStatus.RUNNING
     halt_reason: str | None = None
+    stdout_size: int = 0
+    exit_status: int | None = None
 
     def __post_init__(self) -> None:
         registers = dict(self.registers)
         if set(registers) != set(REGISTER_NAMES):
             raise ValueError("CPUState requires exactly the eight base registers")
-        for value in (*registers.values(), self.rip, self.step_count):
+        for value in (*registers.values(), self.rip, self.step_count, self.stdout_size):
             if type(value) is not int or not 0 <= value <= MASK64:
-                raise ValueError("Machine values and step count must be unsigned 64-bit integers")
+                raise ValueError("Machine values and counters must be unsigned 64-bit integers")
         if type(self.zf) is not bool or not isinstance(self.status, TraceStatus):
             raise ValueError("CPUState requires a boolean ZF and a TraceStatus")
+        if self.exit_status is not None and (type(self.exit_status) is not int
+                                            or not 0 <= self.exit_status <= 255):
+            raise ValueError("Simulated exit status must be an integer in 0..255")
         object.__setattr__(self, "registers", MappingProxyType(registers))
 
 
@@ -94,3 +105,13 @@ class TraceStep:
     branch_target: int | None = None
     executed: bool = False
     fault: TraceFault | None = None
+    output: bytes = b""
+
+
+@dataclass(frozen=True)
+class TraceView:
+    state: CPUState
+    stdout: bytes
+    cursor: int
+    history_size: int
+    last_step: TraceStep | None

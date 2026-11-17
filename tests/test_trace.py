@@ -9,7 +9,7 @@ from byteforge.elf import build_executable
 from byteforge.model import ByteForgeError, ElfConfig, SourceLocation
 from byteforge.parser import parse
 from byteforge.resolver import assemble
-from byteforge.trace import initial_state, prepare_trace, step
+from byteforge.trace import TraceSession, initial_state, prepare_trace, read_memory, step
 from byteforge.trace_model import CPUState, MASK64, REGISTER_NAMES, TraceLimits, TraceStatus
 
 
@@ -406,10 +406,12 @@ class TraceSemanticsTests(unittest.TestCase):
                 state = result.after
         self.assertEqual(state.registers["rax"], 60)
         self.assertEqual(state.registers["rdi"], 7)
-        blocked = step(program, state)
-        self.assertEqual(blocked.fault.code, "unsupported_syscall")
-        self.assertFalse(blocked.executed)
-        self.assertEqual(blocked.after.step_count, 12)
+        exited = step(program, state)
+        self.assertIsNone(exited.fault)
+        self.assertTrue(exited.executed)
+        self.assertEqual(exited.after.step_count, 13)
+        self.assertEqual(exited.after.exit_status, 7)
+        self.assertEqual(exited.after.status, TraceStatus.HALTED)
 
 
 class TraceProgressionTests(unittest.TestCase):
@@ -431,7 +433,7 @@ class TraceProgressionTests(unittest.TestCase):
     def test_syscall_is_explicitly_unsupported_with_no_cpu_effects(self):
         program = prepare_trace("_start: syscall", "syscall.asm", TraceLimits())
         before = replace(initial_state(program), zf=True,
-                         registers={**dict.fromkeys(REGISTER_NAMES, 0), "rax": 60, "rcx": 9})
+                         registers={**dict.fromkeys(REGISTER_NAMES, 0), "rax": 999, "rcx": 9})
         result = step(program, before)
         self.assertEqual(result.fault.code, "unsupported_syscall")
         self.assertEqual(result.fault.location, SourceLocation("syscall.asm", 1, 9, "_start: syscall"))
@@ -444,8 +446,9 @@ class TraceProgressionTests(unittest.TestCase):
         self.assertEqual(result.after.step_count, 0)
         self.assertEqual(result.changed_registers, ())
         self.assertFalse(result.executed)
-        self.assertFalse(hasattr(result.after, "stdout"))
-        self.assertFalse(hasattr(result.after, "exit_status"))
+        self.assertEqual(result.output, b"")
+        self.assertEqual(result.after.stdout_size, 0)
+        self.assertIsNone(result.after.exit_status)
 
     def test_step_limit_stops_infinite_loop_without_extra_execution(self):
         program = prepare_trace("_start: jmp _start", "limit.asm", TraceLimits(max_steps=3))
@@ -517,6 +520,331 @@ class TraceProgressionTests(unittest.TestCase):
         opened.assert_not_called()
         printed.assert_not_called()
         process.assert_not_called()
+
+
+class TraceSyscallTests(unittest.TestCase):
+    def write_fixture(self, *, address=None, count=3, descriptor=1, limits=None):
+        source = '_start: syscall\nmov rax, 60\nsyscall\nmsg: db 65, 0, 255'
+        program = prepare_trace(source, "write.asm", limits or TraceLimits())
+        state = replace(initial_state(program), zf=True, registers={
+            **dict.fromkeys(REGISTER_NAMES, 0), "rax": 1, "rdi": descriptor,
+            "rsi": program.data_base if address is None else address, "rdx": count,
+        })
+        return program, state
+
+    def test_write_captures_exact_bytes_and_return_registers(self):
+        program, before = self.write_fixture()
+        result = step(program, before)
+        self.assertEqual(result.output, b"A\x00\xff")
+        self.assertEqual(result.after.stdout_size, 3)
+        self.assertEqual(result.after.registers["rax"], 3)
+        self.assertEqual(result.after.registers["rcx"], program.entry + 2)
+        self.assertEqual(result.changed_registers, ("rax", "rcx"))
+        for register in ("rbx", "rdx", "rsp", "rbp", "rsi", "rdi"):
+            self.assertEqual(result.after.registers[register], before.registers[register])
+        self.assertTrue(result.after.zf)
+        self.assertEqual(result.after.step_count, 1)
+        self.assertIsNone(result.fault)
+
+    def test_zero_length_write_never_reads_memory(self):
+        for address in (0, MASK64):
+            with self.subTest(address=address):
+                program, state = self.write_fixture(address=address, count=0)
+                with patch("byteforge.trace._read_data") as memory:
+                    result = step(program, state)
+                memory.assert_not_called()
+                self.assertEqual(result.output, b"")
+                self.assertEqual(result.after.registers["rax"], 0)
+                self.assertEqual(result.after.registers["rcx"], program.entry + 2)
+                self.assertTrue(result.executed)
+
+    def test_invalid_write_ranges_fault_without_partial_effects(self):
+        program, state = self.write_fixture()
+        for address, count in ((0, 1), (program.entry, 1), (program.data_base - 1, 1),
+                               (program.data_base, 4), (program.data_base + 3, 1),
+                               (MASK64, MASK64)):
+            with self.subTest(address=address, count=count):
+                before = replace(state, registers={**state.registers, "rsi": address, "rdx": count})
+                result = step(program, before)
+                self.assertEqual(result.fault.code, "invalid_memory")
+                self.assertEqual(result.fault.location, program.instructions[program.entry].statement.location)
+                self.assertEqual(result.after.registers, before.registers)
+                self.assertEqual(result.after.rip, before.rip)
+                self.assertEqual(result.after.stdout_size, 0)
+                self.assertEqual(result.after.step_count, 0)
+                self.assertFalse(result.executed)
+
+    def test_unsupported_descriptors_rejected_even_for_empty_write(self):
+        for descriptor in (0, 2, MASK64):
+            with self.subTest(descriptor=descriptor):
+                program, state = self.write_fixture(descriptor=descriptor, count=0)
+                result = step(program, state)
+                self.assertEqual(result.fault.code, "unsupported_descriptor")
+                self.assertFalse(result.executed)
+
+    def test_output_limit_allows_exact_boundary_then_blocks(self):
+        program, state = self.write_fixture(limits=TraceLimits(max_output_bytes=3))
+        exact = step(program, state)
+        self.assertEqual(exact.after.stdout_size, 3)
+        overflow = step(program, replace(state, stdout_size=1))
+        self.assertEqual(overflow.fault.code, "output_limit")
+        self.assertEqual(overflow.output, b"")
+        self.assertEqual(overflow.after.stdout_size, 1)
+        self.assertEqual(overflow.after.registers, state.registers)
+        self.assertFalse(overflow.executed)
+
+    def test_write_may_read_more_than_inspection_limit(self):
+        program = prepare_trace('_start: syscall\nmov rax, 60\nsyscall\nmsg: db "' + 'A' * 300 + '"',
+                                "long.asm", TraceLimits())
+        state = replace(initial_state(program), registers={**dict.fromkeys(REGISTER_NAMES, 0),
+                        "rax": 1, "rdi": 1, "rsi": program.data_base, "rdx": 300})
+        self.assertEqual(step(program, state).output, b"A" * 300)
+        with self.assertRaisesRegex(ValueError, "0..256"):
+            read_memory(program, program.data_base, 300)
+
+    def test_write_at_end_of_code_keeps_output_and_reports_fallthrough(self):
+        program = prepare_trace('_start: syscall\nmsg: db "A"', "end.asm", TraceLimits())
+        before = replace(initial_state(program), registers={**dict.fromkeys(REGISTER_NAMES, 0),
+                         "rax": 1, "rdi": 1, "rsi": program.data_base, "rdx": 1})
+        result = step(program, before)
+        self.assertEqual(result.output, b"A")
+        self.assertEqual(result.after.stdout_size, 1)
+        self.assertEqual(result.fault.code, "invalid_rip")
+        self.assertTrue(result.executed)
+
+    def test_exit_status_is_low_byte_and_cannot_continue(self):
+        program = prepare_trace("_start: syscall\nmov rdi, 99", "exit.asm", TraceLimits())
+        for value in (0, 7, 256, 511, MASK64):
+            with self.subTest(value=value):
+                before = replace(initial_state(program), zf=True, registers={
+                    **dict.fromkeys(REGISTER_NAMES, 0), "rax": 60, "rdi": value})
+                result = step(program, before)
+                self.assertEqual(result.after.exit_status, value & 255)
+                self.assertEqual(result.after.status, TraceStatus.HALTED)
+                self.assertEqual(result.after.halt_reason, "exit")
+                self.assertEqual(result.after.rip, program.entry + 2)
+                self.assertEqual(result.after.registers["rcx"], program.entry + 2)
+                self.assertEqual(result.after.registers["rdi"], value)
+                self.assertTrue(result.after.zf)
+                self.assertTrue(result.executed)
+                self.assertIsNone(result.fault)
+                self.assertIs(step(program, result.after).after, result.after)
+
+    def test_unsupported_syscall_numbers_remain_faults(self):
+        program = prepare_trace("_start: syscall", "unknown.asm", TraceLimits())
+        for number in (0, 2, 59, 231, MASK64):
+            with self.subTest(number=number):
+                before = replace(initial_state(program), registers={
+                    **dict.fromkeys(REGISTER_NAMES, 0), "rax": number})
+                result = step(program, before)
+                self.assertEqual(result.fault.code, "unsupported_syscall")
+                self.assertIn(str(number), result.fault.message)
+                self.assertEqual(result.after.registers, before.registers)
+                self.assertFalse(result.executed)
+
+    def test_known_examples_have_exact_simulated_results(self):
+        root = Path(__file__).resolve().parents[1]
+        for name in ("hello", "exit", "arithmetic", "loop", "conditional"):
+            with self.subTest(example=name):
+                program = prepare_trace((root / "examples" / (name + ".asm")).read_text(encoding="utf-8"),
+                                        name + ".asm", TraceLimits())
+                view = TraceSession(program).continue_()
+                self.assertEqual(view.state.halt_reason, "exit")
+                self.assertEqual(view.state.exit_status, 0 if name == "hello" else 7)
+                self.assertEqual(view.stdout, b"Hello, World!\n" if name == "hello" else b"")
+
+    def test_syscalls_perform_no_real_io_or_process_execution(self):
+        program, state = self.write_fixture()
+        with patch("builtins.open") as opened, patch("builtins.print") as printed, \
+                patch("os.write") as written, patch("os._exit") as exited, \
+                patch("subprocess.Popen") as process:
+            result = step(program, state)
+            step(program, replace(result.after, registers={**result.after.registers, "rax": 60}))
+        for mocked in (opened, printed, written, exited, process):
+            mocked.assert_not_called()
+
+
+class TraceSessionTests(unittest.TestCase):
+    def session(self, source="_start: mov rax, 1\nadd rax, -1\nmov rax, 60\nsyscall", **limits):
+        return TraceSession(prepare_trace(source, "session.asm", TraceLimits(**limits)))
+
+    def hello(self, **limits):
+        source = (Path(__file__).resolve().parents[1] / "examples" / "hello.asm").read_text(encoding="utf-8")
+        return self.session(source, **limits)
+
+    def test_next_back_and_cached_forward_restore_complete_states(self):
+        session = self.session()
+        initial = session.view()
+        first = session.next()
+        second = session.next()
+        self.assertTrue(second.after.zf)
+        self.assertEqual(session.back().state, first.after)
+        self.assertIs(session.next(), second)
+        self.assertEqual(session.view().history_size, 2)
+        self.assertEqual(session.back().state, first.after)
+        self.assertEqual(session.back().state, initial.state)
+        self.assertEqual(session.back().state, initial.state)
+
+    def test_back_across_write_and_replay_does_not_duplicate_output(self):
+        session = self.hello()
+        for _ in range(5):
+            session.next()
+        written = session.view()
+        self.assertEqual(written.stdout, b"Hello, World!\n")
+        self.assertEqual(written.state.registers["rax"], 14)
+        self.assertEqual(written.state.registers["rcx"], 0x40102A)
+        back = session.back()
+        self.assertEqual(back.stdout, b"")
+        self.assertEqual(back.state.registers["rax"], 1)
+        self.assertEqual(back.state.registers["rcx"], 0)
+        self.assertIs(session.next(), written.last_step)
+        self.assertEqual(session.view(), written)
+        session.continue_()
+        self.assertEqual(session.view().stdout, b"Hello, World!\n")
+
+    def test_multiple_writes_keep_prefixes_and_append_only_at_frontier(self):
+        source = ('_start: mov rax, 1\nmov rdi, 1\nmov rsi, msg\nmov rdx, 1\nsyscall\n'
+                  'mov rax, 1\nsyscall\nmov rax, 60\nsyscall\nmsg: db "A"')
+        session = self.session(source)
+        session.continue_(7)
+        two = session.view()
+        self.assertEqual(two.stdout, b"AA")
+        self.assertEqual(session.back().stdout, b"A")
+        session.next()
+        self.assertEqual(session.view(), two)
+        self.assertEqual(session.continue_().stdout, b"AA")
+
+    def test_back_across_exit_restores_running_state_then_cached_exit(self):
+        session = self.session()
+        exited = session.continue_()
+        self.assertEqual(exited.state.exit_status, 0)
+        prior = session.back()
+        self.assertEqual(prior.state.status, TraceStatus.RUNNING)
+        self.assertIsNone(prior.state.exit_status)
+        self.assertIs(session.next(), exited.last_step)
+        self.assertEqual(session.view(), exited)
+        self.assertFalse(session.next().executed)
+        self.assertEqual(session.view(), exited)
+
+    def test_reset_clears_history_output_and_exit_state(self):
+        session = self.hello()
+        session.continue_()
+        reset = session.reset()
+        self.assertEqual(reset.state, initial_state(session.program))
+        self.assertEqual(reset.stdout, b"")
+        self.assertEqual((reset.cursor, reset.history_size), (0, 0))
+        self.assertIsNone(reset.last_step)
+        self.assertEqual(session.continue_().stdout, b"Hello, World!\n")
+
+    def test_snapshots_and_views_stay_immutable_after_reset(self):
+        session = self.hello()
+        before = session.continue_()
+        session.reset()
+        self.assertEqual(before.stdout, b"Hello, World!\n")
+        self.assertEqual(before.state.exit_status, 0)
+        with self.assertRaises(FrozenInstanceError):
+            before.stdout = b"changed"
+        with self.assertRaises(TypeError):
+            before.state.registers["rax"] = 1
+        with self.assertRaises(AttributeError):
+            session.program = session.program
+
+    def test_session_uses_independent_assembly_lookups(self):
+        session = self.session()
+        session.program.program.statements.clear()
+        session.program.assembly.items.clear()
+        session.program.assembly.symbols.clear()
+        self.assertEqual(session.continue_().state.exit_status, 0)
+
+    def test_continue_limits_requests_and_replays_cache(self):
+        session = self.session("_start: jmp _start")
+        self.assertEqual(session.continue_().state.step_count, 100)
+        self.assertEqual(session.continue_(3).state.step_count, 103)
+        for _ in range(3):
+            session.back()
+        self.assertEqual(session.continue_(2).state.step_count, 102)
+        self.assertEqual(session.view().history_size, 103)
+        for count in (0, -1, 101, True, 1.5):
+            with self.subTest(count=count):
+                with self.assertRaises(ValueError):
+                    session.continue_(count)
+
+    def test_lower_continue_limit_is_enforced(self):
+        session = self.session("_start: jmp _start", max_continue_steps=2)
+        self.assertEqual(session.continue_(2).state.step_count, 2)
+        with self.assertRaises(ValueError):
+            session.continue_(3)
+
+    def test_step_limit_fault_is_cached_reversible_and_bounded(self):
+        session = self.session("_start: jmp _start", max_steps=3)
+        stopped = session.continue_()
+        self.assertEqual(stopped.state.halt_reason, "step_limit")
+        self.assertEqual(stopped.state.step_count, 3)
+        self.assertEqual(stopped.history_size, 4)
+        self.assertEqual(session.back().state.status, TraceStatus.RUNNING)
+        session.next()
+        self.assertEqual(session.view(), stopped)
+        session.continue_()
+        self.assertEqual(session.view(), stopped)
+
+    def test_history_limit_stops_without_dropping_previous_states(self):
+        session = self.session("_start: jmp _start", max_history=2)
+        stopped = session.continue_()
+        self.assertEqual(stopped.state.halt_reason, "history_limit")
+        self.assertEqual(stopped.state.step_count, 2)
+        self.assertEqual(stopped.history_size, 3)
+        session.next()
+        self.assertEqual(session.view().history_size, 3)
+        self.assertEqual(session.back().state.status, TraceStatus.RUNNING)
+
+    def test_fault_and_preexisting_stdout_are_restored_on_back(self):
+        session = self.hello(max_output_bytes=1)
+        faulted = session.continue_()
+        self.assertEqual(faulted.state.halt_reason, "output_limit")
+        self.assertEqual(faulted.stdout, b"")
+        self.assertEqual(session.back().state.status, TraceStatus.RUNNING)
+        session.next()
+        self.assertEqual(session.view(), faulted)
+
+
+class TraceAdditionalBoundsTests(unittest.TestCase):
+    def test_new_limits_reject_unbounded_values(self):
+        for name, maximum in (("max_output_bytes", 65536), ("max_history", 10000),
+                              ("max_continue_steps", 100), ("max_memory_bytes", 256)):
+            for value in (0, -1, True, 1.5, maximum + 1):
+                with self.subTest(name=name, value=value):
+                    with self.assertRaises(ValueError):
+                        TraceLimits(**{name: value})
+
+    def test_stdout_size_and_exit_status_validation(self):
+        for value in (-1, 1 << 64, True, 1.5):
+            with self.subTest(size=value):
+                with self.assertRaises(ValueError):
+                    CPUState(rip=0, stdout_size=value)
+        for value in (-1, 256, True, 1.5):
+            with self.subTest(status=value):
+                with self.assertRaises(ValueError):
+                    CPUState(rip=0, exit_status=value)
+
+    def test_memory_inspection_exact_bounds_and_bytes(self):
+        program = prepare_trace('_start: syscall\nmsg: db 0, 65, 255', "memory.asm", TraceLimits())
+        self.assertEqual(read_memory(program, program.data_base, 3), b"\0A\xff")
+        self.assertEqual(read_memory(program, program.data_base + 1, 2), b"A\xff")
+        self.assertEqual(read_memory(program, program.data_base + 3, 0), b"")
+        for address, size in ((program.entry, 1), (program.data_base - 1, 1),
+                              (program.data_base, 4), (program.data_base + 3, 1),
+                              (-1, 1), (MASK64 + 1, 0), (True, 0),
+                              (program.data_base, -1), (program.data_base, 257),
+                              (program.data_base, True)):
+            with self.subTest(address=address, size=size):
+                with self.assertRaises(ValueError):
+                    read_memory(program, address, size)
+
+    def test_empty_data_memory_inspection(self):
+        program = prepare_trace('_start: syscall\nmsg: db ""', "empty.asm", TraceLimits())
+        self.assertEqual(read_memory(program, program.data_base, 0), b"")
+        with self.assertRaises(ValueError):
+            read_memory(program, program.data_base, 1)
 
 
 if __name__ == "__main__":

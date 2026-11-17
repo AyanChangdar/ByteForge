@@ -28,7 +28,8 @@ Reports and visualization remain planned.
 
 The HTML/CSS/JavaScript visualizer will display source instructions, virtual
 addresses, encoded bytes, resolved symbols, and the generated ELF layout. It
-is a build-time explanation tool, not a CPU emulator.
+is planned. Separately, TraceLab Stage 6A.2 now provides bounded educational
+simulation through a terminal debugger; it never executes the generated ELF.
 
 ## Usage (Stage 5B.2)
 
@@ -143,6 +144,37 @@ Windows can generate the same ELF file but cannot execute it directly. Copy
 it to Linux/WSL and apply executable permissions there if necessary. The CLI
 only builds files; it never runs generated programs.
 
+## TraceLab terminal debugger (Stage 6A.2)
+
+On Windows PowerShell or Linux/WSL, from the repository root:
+
+```bash
+python -m byteforge.trace_cli examples/loop.asm --interactive
+python -m byteforge.trace_cli examples/hello.asm --interactive
+```
+
+Use `next`/`n`, `back`, `registers`, `memory ADDRESS [LENGTH]`,
+`continue`/`c [STEPS]`, `reset`, `help`, and `quit`/`q`. For Hello World,
+`memory 0x401040 14` inspects the DB bytes, and `continue` captures exactly
+`b"Hello, World!\n"` with simulated exit status 0. The loop and conditional
+examples simulate exit status 7. Debugger quit/EOF returns 0 independently of
+that simulated status; Ctrl+C returns 130.
+
+This is **SIMULATED CPU STATE**, starting with zero registers and ZF=false,
+not Linux process-entry registers or hardware inspection. Only ByteForge's
+existing typed instructions and modeled stdout write/exit syscalls are traced.
+Successful syscalls set RCX to the following instruction address; ZF is
+preserved, and R11/full RFLAGS are not modeled. Other syscalls, descriptors and
+unmapped memory accesses fault explicitly. Captured output is displayed as a
+byte string; the engine does not print or invoke OS syscalls.
+
+Back restores registers, RIP, flags, halt/exit state and visible output.
+Forward reuses cached history; reset clears history and output. Defaults cap
+source/output at 64 KiB each, instructions at 2,048, executed steps/history
+transitions at 10,000, continue requests at 100 steps and memory inspections
+at 256 bytes. The browser, HTTP API and instruction inspector remain deferred.
+See [TraceLab contracts](docs/TRACELAB.md) for exact limits and semantics.
+
 ## Development
 
 ```bash
@@ -157,6 +189,8 @@ python -m unittest discover -s tests -p test_parser.py
 python -m unittest discover -s tests -p test_encoder.py
 python -m unittest discover -s tests -p test_elf.py
 python -m unittest discover -s tests -p test_integration.py
+python -m unittest discover -s tests -p test_trace.py
+python -m unittest discover -s tests -p test_trace_cli.py
 ```
 
 Structural and CLI tests run on Windows and Linux. Native tests execute only
@@ -188,7 +222,7 @@ schedule.
 ## Scope boundaries
 
 ByteForge will not implement dynamic linking, object files, macros, complex
-expressions, full x86-64 coverage, CPU emulation, KVM integration, or external
+expressions, full x86-64 coverage, general-purpose CPU emulation, KVM integration, or external
 assembler/linker invocation. Linux x86-64 is the only execution target.
 The current assembler does not prove that arbitrary instruction sequences
 terminate or use Linux syscalls correctly. Writable data, computed expressions,
