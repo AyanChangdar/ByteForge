@@ -54,6 +54,22 @@ XOR and SYSCALL pipeline. Loop and conditional examples supplement the exit,
 Hello World and arithmetic demos. Code/data layout and the fixed ELF format
 are preserved. Reports and visualization remain planned.
 
+Stage 6A.1 adds `byteforge/trace_model.py`, `byteforge/trace.py` and
+`tests/test_trace.py` without changing any assembler interfaces or output.
+`prepare_trace(source, filename, limits)` reuses parse, assemble and ELF
+generation, then copies instruction-address and symbol lookups from the actual
+metadata. `initial_state(program)` uses the resolved entry, and
+`step(program, state)` simulates at most one supported typed instruction.
+Trace-only contracts live in `trace_model.py`; assembler contracts remain in
+`model.py`. States are immutable with read-only register mappings. Registers
+start at zero and ZF starts false; these are educational values, not Linux
+process-entry registers. Source/instruction/step limits bound execution.
+SYSCALL returns an explicit unsupported fault: stdout, exit semantics, reverse
+history, a trace CLI and the web interface are not implemented in this stage.
+See [TraceLab contracts and semantics](TRACELAB.md) for exact state, stepping,
+address-validation and fault behavior. Earlier static-report proposals remain
+unimplemented and do not describe the current trace engine.
+
 ## 3. Shared data model and interfaces
 
 `model.py` is the contract between modules. Use dataclasses and enums rather
