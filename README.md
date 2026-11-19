@@ -7,7 +7,7 @@ and packages them as a fixed-address Linux executable. TraceLab adds browser
 and terminal interfaces for inspecting those same instructions through a
 bounded Python simulation.
 
-The project is built for Computer Organization and Architecture education.
+
 Its implementation uses Python's standard library, HTML, CSS, and vanilla
 JavaScript. No external assembler, linker, frontend build step, or runtime
 package installation is required.
