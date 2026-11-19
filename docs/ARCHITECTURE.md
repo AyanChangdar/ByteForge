@@ -35,6 +35,8 @@ ByteForge/
 |   |-- styles.css
 |   `-- app.js
 |-- examples/
+|   |-- arithmetic.asm    # implemented arithmetic exit-status-7 demo
+|   |-- exit.asm          # implemented exit-status-7 demo
 |   |-- hello.asm
 |   |-- loop.asm
 |   `-- conditional.asm
@@ -47,37 +49,82 @@ ByteForge/
 `-- build/                 # ignored generated artifacts
 ```
 
-Only the documentation files exist at the architecture stage. Implementation
-folders should be added after architecture review.
+Stage 5B.2 adds fixed-width JMP, JE and JNE to the existing MOV, arithmetic,
+XOR and SYSCALL pipeline. Loop and conditional examples supplement the exit,
+Hello World and arithmetic demos. Code/data layout and the fixed ELF format
+are preserved. Reports and visualization remain planned.
+
+Stage 6A.1 adds `byteforge/trace_model.py`, `byteforge/trace.py` and
+`tests/test_trace.py` without changing any assembler interfaces or output.
+`prepare_trace(source, filename, limits)` reuses parse, assemble and ELF
+generation, then copies instruction-address and symbol lookups from the actual
+metadata. `initial_state(program)` uses the resolved entry, and
+`step(program, state)` simulates at most one supported typed instruction.
+Trace-only contracts live in `trace_model.py`; assembler contracts remain in
+`model.py`. States are immutable with read-only register mappings. Registers
+start at zero and ZF starts false; these are educational values, not Linux
+process-entry registers. Source/instruction/step limits bound execution.
+SYSCALL returns an explicit unsupported fault: stdout, exit semantics, reverse
+history, a trace CLI and the web interface are not implemented in this stage.
+See [TraceLab contracts and semantics](TRACELAB.md) for exact state, stepping,
+address-validation and fault behavior. Earlier static-report proposals remain
+unimplemented and do not describe the current trace engine.
 
 ## 3. Shared data model and interfaces
 
 `model.py` is the contract between modules. Use dataclasses and enums rather
 than passing loosely structured dictionaries through the assembler core.
 
-Suggested types:
+Implemented parser types (all frozen dataclasses):
 
 ```python
 SourceLocation(filename: str, line: int, column: int, text: str)
-Register(name: str, code: int, width: int)
-Immediate(value: int)
-SymbolRef(name: str)
-StringLiteral(value: bytes)
-Instruction(mnemonic: str, operands: tuple, location: SourceLocation)
+Register(name: str, code: int, width: int, location: SourceLocation)
+Immediate(value: int, location: SourceLocation)
+SymbolReference(name: str, location: SourceLocation)
+Instruction(mnemonic: str,
+            operands: tuple[Register | Immediate | SymbolReference, ...],
+            location: SourceLocation)
 Label(name: str, location: SourceLocation)
-DataDirective(label: str | None, data: bytes, location: SourceLocation)
-Program(statements: list)
-EncodedItem(address: int, data: bytes, statement, resolution: dict)
-AssemblyResult(code: bytes, data: bytes, symbols: dict, items: list)
-ElfLayout(entry: int, segments: list, file_size: int)
+DataDirective(data: bytes, location: SourceLocation)
+Program(statements: list[Instruction | Label | DataDirective])
 ```
+
+`Program` preserves source statement order. Its field cannot be reassigned,
+but its list remains mutable. A labeled instruction or directive produces a
+separate `Label` followed by that statement; data directives never own labels.
+Operands retain their own locations for later encoder/resolver diagnostics.
+Register codes are `rax=0`, `rcx=1`, `rdx=2`, `rbx=3`, `rsp=4`, `rbp=5`,
+`rsi=6`, `rdi=7`, with width 64.
+
+Implemented downstream contracts (also frozen dataclasses):
+
+```python
+EncodedItem(address: int, data: bytes, statement: Instruction,
+            resolution: dict[str, int])
+AssemblyResult(code: bytes, data: bytes, symbols: dict[str, int],
+               items: list[EncodedItem])
+ElfConfig(image_base: int = 0x400000, code_offset: int = 0x1000,
+          alignment: int = 0x1000)
+ElfSegment(p_type: int, p_flags: int, p_offset: int, p_vaddr: int,
+           p_paddr: int, p_filesz: int, p_memsz: int, p_align: int)
+ElfLayout(entry: int, segments: list[ElfSegment], file_size: int)
+```
+
+Each encoded item retains its original instruction and location. Symbolic MOV
+records `{symbol_name: absolute_address}` in its resolution metadata; numeric
+instructions retain an empty dictionary. Items describe instructions only.
+`AssemblyResult.data` holds concatenated DB bytes separately from code.
+Frozen result objects contain ordinary mutable collections, which callers
+should treat as read-only. ElfConfig names
+the fixed layout; the writer rejects configurations other than approved defaults.
 
 The implemented diagnostic contract is `SourceLocation` and
 `ByteForgeError(location: SourceLocation, message: str)` in `model.py`.
 `SourceLocation` is an immutable dataclass. Its `text` field preserves the
 original source line, including whitespace, without the line terminator.
 Callers supply one-based line and column numbers; columns count Python string
-characters, not terminal display cells. The remaining types above are planned.
+characters, not terminal display cells.
 
 `ByteForgeError` exposes `location` and `message`. Calling `str(error)` returns:
 
@@ -103,7 +150,8 @@ ownership and return directions should remain stable:
 - `encoder.encoded_size(instruction: Instruction) -> int`
 - `encoder.encode(instruction: Instruction, address: int,
   symbols: Mapping[str, int]) -> bytes`
-- `resolver.assemble(program: Program, base_address: int) -> AssemblyResult`
+- `resolver.assemble(program: Program, base_address: int,
+  *, filename: str = "<input>") -> AssemblyResult`
 - `elf.build_executable(result: AssemblyResult,
   config: ElfConfig) -> tuple[bytes, ElfLayout]`
 - `report.build_report(program, result, elf_layout) -> dict`
@@ -115,61 +163,126 @@ print output, parse command-line arguments, or import the visualizer.
 
 ### Stage 1: Parse and validate syntax
 
-The parser reads one line at a time, strips `;` comments outside quoted
-strings, recognizes optional labels, and converts instructions and data
-directives into typed statements. Mnemonics and register names are normalized
-to lowercase. Integers use decimal or `0x` hexadecimal syntax, with an
-optional leading minus sign where the selected encoding permits it.
+`parse(source: str, filename: str) -> Program` scans one line at a time,
+recognizes quoted strings before interpreting `;` comments, and produces typed
+statements without file I/O or printing. LF, CRLF and CR line endings are
+accepted. Original lines, including whitespace and comments, are retained in
+source locations without line terminators. Mnemonic/directive locations point
+to their first character; labels and operands point to their own first
+characters. Missing input is marked immediately after the last syntactic token,
+before trailing whitespace or a comment. Parsing stops at the first
+`ByteForgeError`.
 
-Recommended grammar for the first version:
+Implemented Stage 5B.2 grammar:
 
 ```text
 line       := [label ":"] [instruction | data] [";" comment]
-instruction:= mnemonic [operand ["," operand]]
-operand    := register | integer | identifier
-data       := "db" string ["," integer ...]
+instruction:= "mov" register "," (integer | identifier) | "syscall"
+            | ("add" | "sub" | "cmp") register "," integer
+            | "xor" register "," register
+            | ("jmp" | "je" | "jne") identifier
+data       := "db" value ["," value ...]
+value      := string | integer
+integer    := ["+" | "-"] (decimal_digits | "0x" hexadecimal_digits)
 ```
 
-Labels use `[A-Za-z_][A-Za-z0-9_]*`. Reject duplicate labels, malformed
-strings, unsupported mnemonics, wrong operand counts, unknown registers, and
-out-of-range immediates with filename, line, column, and source context.
+Mnemonics and registers are case-insensitive and normalize to lowercase;
+hexadecimal prefixes may also be `0X`. Decimal literals with leading zeros
+remain decimal. Labels and symbol references match `[A-Za-z_][A-Za-z0-9_]*`
+and preserve case. Only one label is allowed per line. References remain
+unresolved; duplicate/undefined symbols and the required `_start` entry are
+deferred to assembly. The parser does not require an entry point.
+
+MOV destinations must be one of the eight supported registers. Supported
+registers in source position are rejected because register-to-register MOV is
+deferred. Unsupported general-purpose register spellings (`eax`, `ax`, `al`,
+`r8` through `r15` and their width variants, and instruction-pointer names)
+are reserved and rejected in operand positions. Other identifiers, including
+`raq` or `r8_buffer`, are permitted as symbolic sources. MOV immediate values
+retain their integer value; encoding-width validation belongs to the encoder.
+Python's integer conversion limits may reject exceptionally large literals.
+
+ADD, SUB and CMP require a base 64-bit register destination and an integer
+source. XOR requires two base 64-bit registers, with destination first.
+The parser rejects arithmetic symbols/register sources, XOR immediates,
+memory operands, unsupported registers and wrong operand counts. Encoding-width
+range checks remain in the encoder. Existing quoting, comments, labels, DB,
+numeric literal rules and source-location conventions are unchanged. JMP,
+JE and JNE require exactly one label identifier and preserve its spelling.
+Numeric, register, string, expression and memory branch targets are rejected.
+Register spellings are reserved in branch operand position, as in symbolic MOV.
+
+DB accepts a nonempty comma-separated sequence of double-quoted ASCII strings
+and numeric bytes in `0..255`. Empty strings are allowed. Strings support only
+`\\`, `\"`, `\n`, `\r`, `\t`, and `\0` escapes. Unknown escapes,
+non-ASCII characters, unterminated strings and invalid numeric bytes are errors.
+Commas, colons and semicolons inside strings are literal characters.
+
+Missing/extra operands, missing commas, malformed labels/numbers, unsupported
+instructions/registers and incorrect operand combinations raise source-located
+diagnostics. Expressions, memory operands, register-to-register MOV,
+single-quoted/multiline strings, sections and macros are unsupported. No
+addresses, instruction sizes or machine code are calculated by the parser.
 
 ### Stage 2: Layout and collect symbols
 
 The resolver performs pass 1 over the parsed program. It asks the encoder for
-each instruction's exact size and assigns offsets to instructions, labels, and
-data. To keep layout deterministic, all `JMP`, `JE`, and `JNE` instructions use
-their near `rel32` forms; ByteForge does not relax them into short branches.
+each instruction's exact size, records instruction addresses and collects
+labels at the current address cursor. `base_address` means the virtual address
+of the first code byte, not the ELF image base. The first DB starts the data
+region, even for `db ""`. Every later instruction is rejected at its source
+location; code/data interleaving is never reordered. DB bytes advance the
+cursor by their exact length, without padding or an implicit terminator.
+Every duplicate label is an error at the second definition. `_start` remains
+case-sensitive, required, and must identify a code instruction boundary;
+an entry in data or at end-of-code is rejected.
 
-The first implementation should place code followed by read-only string data
-inside one loadable segment. This avoids section-table complexity and still
-produces a valid native executable. Symbol values are final virtual addresses:
+Symbol values are virtual addresses. The CLI passes
+`ElfConfig.image_base + ElfConfig.code_offset` as the code base:
 
 ```text
-symbol address = image base + load segment file offset + item offset
+code base = image base + code file offset
+code symbol address = code base + instruction offset
+data symbol address = code base + total code size + data offset
 ```
 
-Pass 1 fails on duplicate definitions. References may remain unresolved until
-pass 2, allowing forward branches and forward references to data.
+For a missing `_start`, the diagnostic uses the first statement's location.
+An empty program uses `filename:1:1` and empty source text; the CLI supplies
+the input filename through the optional keyword. Separate and consecutive
+labels bind to the same current cursor as inline labels. Trailing labels may
+mark one-past-end positions, but `_start` must identify an instruction. Code,
+data and label addresses are checked for 64-bit overflow. Bare `db` is still
+invalid syntax; empty data uses the existing `db ""` form.
 
 ### Stage 3: Encode and resolve references
 
-Pass 2 encodes every instruction with the final symbol table.
+Pass 2 calls the existing `encode(instruction, address, symbols)` with the
+final addresses and label table. Every emitted length must match its planned
+size; a mismatch raises a source-located `ByteForgeError`. No file I/O or
+printing occurs. Symbolic MOV looks up the case-sensitive symbol name and
+encodes its absolute address using the same ten-byte form as numeric MOV.
+Undefined symbols raise `ByteForgeError` at the symbol operand's location.
+`AssemblyResult.items` preserves code bytes and source/resolution metadata;
+`code` and `data` remain separate payloads.
 
-- A near branch uses `disp32 = target - address_after_instruction`.
-- A symbolic `MOV r64, label` uses the resolved 64-bit virtual address as its
-  immediate. This is valid because the first version emits fixed-address
-  `ET_EXEC`, not PIE.
-- Missing symbols and values outside their encoding range are errors.
+After pass 1, the resolver constructs the set of planned instruction-start
+addresses and uses it for entry and branch validation. Before encoding each
+JMP/JE/JNE, it checks that the case-sensitive target exists and belongs to that
+set. Code aliases are allowed; targets in DB data (including empty directives),
+at end-of-code or inside an instruction are rejected at the operand location.
+Instructions after DB remain unsupported. Symbolic MOV still accepts code or
+data addresses, including addresses that are not valid branch destinations.
 
-`AssemblyResult.items` retains source location, virtual address, bytes, and
-resolution details so the visualizer does not need to reverse-engineer the
-binary.
+Branch displacement is `target - (instruction_address + fixed_size)`.
+Forward/backward references use the completed table; no instruction size or
+address changes during pass 2. Existing size-mismatch checks remain in force.
+Symbol expressions, indirect branches and branch relaxation remain unsupported.
 
 ### Stage 4: Build the ELF64 executable
 
-`elf.py` constructs the file with `struct.pack` using explicit little-endian
-formats. The minimum image is:
+`elf.py` builds bytes in memory using explicit little-endian struct formats:
+`<16sHHIQQQIHHHHHH` (64-byte ELF header) and `<IIQQQQQQ` (56-byte program
+header). The single PT_LOAD maps the entire file, including headers and padding.
 
 ```text
 +------------------------+ file offset 0
@@ -178,22 +291,44 @@ formats. The minimum image is:
 | Program header         | 56 bytes, PT_LOAD
 +------------------------+
 | padding/alignment      |
-+------------------------+ load segment offset
++------------------------+ code file offset 0x1000
 | encoded instructions   | entry points to _start
-| string data            |
++------------------------+
+| DB bytes               | immediately after code
 +------------------------+
 ```
 
-Required ELF properties are `ELFCLASS64`, little endian, System V ABI,
-`ET_EXEC`, `EM_X86_64`, and one `PT_LOAD` segment. The segment can be `PF_R |
-PF_X` for the demonstration because strings are read-only. No section-header
-table is required for execution. File offset and virtual address congruence
-must satisfy the selected `p_align` (normally `0x1000`). `_start` is required
-and becomes `e_entry`.
+The fixed image base is `0x400000`; code starts at virtual address `0x401000`.
+The header identity is ELFCLASS64, little endian, current version, System V
+ABI. Type is ET_EXEC (2), machine EM_X86_64 (62), version 1 and flags 0.
+`e_phoff=64`, `e_ehsize=64`, `e_phentsize=56`, `e_phnum=1`. All section-header
+fields are zero. There is no interpreter or dynamic-linking metadata.
 
-The CLI writes the completed bytes and applies executable permission bits on
-POSIX. On Windows it still creates the ELF file, which must be copied to Linux
-or WSL for execution.
+The segment has `p_type=1`, `p_flags=5` (read/execute), `p_offset=0`,
+`p_vaddr=p_paddr=0x400000`, `p_filesz=p_memsz=len(image)`, and `p_align=0x1000`.
+Virtual address and file offset are congruent modulo alignment. Padding from
+file offset 120 to 4096 is zero. `_start` supplies `e_entry`; it is not assumed
+to be the first instruction. The exit example has entry `0x401000`, 22 code
+bytes and a 4118-byte file. The Hello World example has 64 code bytes followed
+by `b"Hello, World!\n"` (14 bytes): `msg=0x401040`, data file offset `0x1040`,
+and file/segment size 4174 bytes. Both examples enter at `0x401000`.
+File size is `code_offset + len(code) + len(data)`; memory size equals it.
+
+The writer validates struct sizes, the fixed layout/alignment, assembly item
+addresses, payload consistency, total length, 64-bit bounds and entry range
+and instruction boundary. Invalid internal configuration/result contracts
+raise `ValueError`; source errors use `ByteForgeError` earlier in the pipeline.
+The writer performs no file I/O or printing.
+
+The CLI uses `python -m byteforge.cli examples/exit.asm -o build/exit` and
+composes parse, assemble and build_executable. It reads UTF-8 input and builds
+the complete image before creating output directories and exclusively creating
+the output file. Existing output and input/output path equality are rejected.
+It adds owner-execute permission on POSIX, displays a byte count and entry on
+success, and displays structured source diagnostics or file errors on failure.
+Exit codes are 0 for success, 1 for build/file errors and 2 for argument errors.
+It never runs generated programs. On Windows the file must be copied to Linux
+or compatible WSL and given executable permission there as needed.
 
 ### Stage 5: Generate the visualization report
 
@@ -211,7 +346,26 @@ and an ELF layout diagram. It does not execute or emulate instructions.
 
 ## 5. Supported instruction forms
 
-Keep the encoding matrix explicit and small. The minimum planned forms are:
+Keep the encoding matrix explicit and small. Stage 5B.2 supports exactly
+the following instruction forms, using only the eight base 64-bit registers:
+
+| Instruction | Operand form | Bytes | Size |
+|---|---|---|---|
+| `MOV` | base `r64, integer` | `48`, `B8 + register_code`, little-endian imm64 | 10 |
+| `MOV` | base `r64, symbol` | same form, with the resolved absolute virtual address | 10 |
+| `SYSCALL` | no operands | `0F 05` | 2 |
+| `ADD` | base `r64, signed imm32` | `48 81`, ModR/M `/0`, imm32 | 7 |
+| `SUB` | base `r64, signed imm32` | `48 81`, ModR/M `/5`, imm32 | 7 |
+| `CMP` | base `r64, signed imm32` | `48 81`, ModR/M `/7`, imm32 | 7 |
+| `XOR` | base `r64, r64` | `48 31`, register-direct ModR/M | 3 |
+| `JMP` | label | `E9`, signed little-endian rel32 | 5 |
+| `JE` | label | `0F 84`, signed little-endian rel32 | 6 |
+| `JNE` | label | `0F 85`, signed little-endian rel32 | 6 |
+
+DB is supported only after instructions. Arithmetic imm8 optimizations,
+register-register ADD/SUB/CMP, register-register MOV, XOR immediates, indirect
+branches and other branch mnemonics are unsupported. The broader target matrix below includes deferred
+forms and must not be read as the implemented subset:
 
 | Instruction | Operand form | Purpose |
 |---|---|---|
@@ -242,17 +396,17 @@ A working Hello World needs only `MOV r64, imm64`, `SYSCALL`, labels, and `db`:
 _start:
     mov rax, 1          ; Linux write syscall
     mov rdi, 1          ; stdout
-    mov rsi, message    ; fixed virtual address of data label
-    mov rdx, 13         ; byte count
+    mov rsi, msg        ; fixed virtual address of data label
+    mov rdx, 14         ; byte count
     syscall
     mov rax, 60         ; Linux exit syscall
     mov rdi, 0          ; status
     syscall
 
-message: db "Hello World!", 10
+msg: db "Hello, World!", 10
 ```
 
-This avoids memory-addressing modes and linker relocations. `message` is
+This avoids memory-addressing modes and linker relocations. `msg` is
 resolved to an absolute `imm64` in the fixed-address executable. The string
 length is a literal in version one; computed expressions such as
 `message_end - message` are explicitly deferred.
@@ -260,16 +414,100 @@ length is a literal in version one; computed expressions such as
 ## 6. Instruction encoding boundaries
 
 The encoder owns opcode selection, REX prefixes, ModR/M bytes, immediate
-width/range checks, and little-endian packing. It should use a small dispatch
-table keyed by `(mnemonic, operand kinds)` and dedicated helpers, not a generic
-x86 description language.
+width/range checks, and little-endian packing. The minimal implementation uses
+a small form-size table keyed by `(mnemonic, operand kinds)`, shared validation
+and direct encoding functions. Extend this with dedicated handlers as forms
+are added; do not introduce a generic x86 description language.
+
+Implemented public interfaces remain:
+
+```python
+encoded_size(instruction: Instruction) -> int
+encode(instruction: Instruction, address: int,
+       symbols: Mapping[str, int]) -> bytes
+```
+
+Both functions validate the form, operand count/types, base-register
+name/code/width consistency and immediate range. They consume the parser's
+normalized lowercase models. Invalid operands use their own source location;
+unsupported mnemonics or wrong operand counts use the instruction location.
+Errors are `ByteForgeError`, with no file I/O or printing. `encoded_size()`
+accepts unresolved symbols and returns 10 without a symbol lookup, enabling
+forward references. `encode()` resolves symbolic operands through the supplied
+mapping. Absolute symbol values must be integers in `0..2^64-1`; negative,
+overflowing and noninteger mapped values are rejected at the symbol location.
+For JMP/JE/JNE, sizing accepts unresolved symbols and returns the fixed size
+without lookup. Encoding uses the actual instruction address and final symbol
+mapping to compute the next-instruction-relative displacement. Out-of-range
+signed rel32 values raise `ByteForgeError` at the target operand. The encoder
+also rejects invalid unsigned target addresses and invalid instruction-address
+ranges. Direct `encode()` callers supply addresses only; instruction-boundary
+validation requires the complete program and belongs to the resolver.
+
+MOV accepts integers from `-2^63` through `2^64-1` inclusive. Negative values
+use their 64-bit two's-complement representation. Values are range-checked
+before masking and packed with `struct.pack("<Q", ...)`; out-of-range values
+are rejected rather than truncated. Noninteger values in constructed
+`Immediate` models are rejected. MOV always uses the ten-byte form, including
+for zero or small immediates. SYSCALL is always two bytes.
+
+ADD/SUB/CMP always use Group 1 opcode `81`, REX.W and a signed imm32 packed
+with `<i`. Accept exactly `-2147483648..2147483647`; the CPU sign-extends the
+immediate to 64 bits. Positive `0xFFFFFFFF` is rejected while `-1` is accepted.
+ModR/M is `0xC0 | (extension << 3) | destination_code`, where ADD is `/0`,
+SUB `/5` and CMP `/7`. No imm8 or accumulator-specific encodings are selected.
+Lengths remain seven bytes for every register and immediate value.
+
+XOR uses `48 31` and ModR/M `0xC0 | (source_code << 3) | destination_code`.
+Opcode 31 writes the r/m operand: the first assembly operand is the destination
+and the second occupies reg. Thus `xor rax, rbx` is `48 31 D8`; reversing the
+operands gives different bytes and changes the destination. XOR is three bytes.
+All register metadata is validated by both sizing and encoding. The arithmetic
+demo is 36 code bytes (4132 ELF bytes), enters at `0x401000` and computes exit
+status 7. CMP changes flags only; JE tests ZF=1 and JNE tests ZF=0.
+
+Branch encodings contain no REX prefix. `_rel32(target, address, size, location)`
+checks `-2147483648..2147483647` and packs the displacement using `<i`.
+The emitted branch length is checked against the form-size table.
+At `0x401000` targeting `0x401010`, JMP is `E9 0B 00 00 00`, JE is
+`0F 84 0A 00 00 00` and JNE is `0F 85 0A 00 00 00`. No short forms are selected.
+
+The loop demo decrements RCX from 3, compares it with zero and branches back.
+Its JNE at `0x401018` targets `0x40100A`: displacement
+`0x40100A - 0x40101E = -20`, bytes `0F 85 EC FF FF FF`. It has 52 code bytes
+and a 4148-byte ELF. The conditional demo uses a non-taken JNE followed by a
+taken JE; success selects exit status 7 instead of the failure status 99.
+It has 66 code bytes and a 4162-byte ELF. Both enter at `0x401000`.
+
+Current private helpers are `_base_register_code(register)` for register
+validation, `_rex(w, r=0, x=0, b=0)` for prefix composition, and
+`_pack_imm64(value, location)` for validated little-endian immediate bytes.
+`_imm64_bits(value, location)` shares range validation between sizing and
+packing. REX is `0x40 | W<<3 | R<<2 | X<<1 | B`; current MOV sets only W.
+`_modrm_register(reg_code, rm_code)` composes register-only ModR/M from validated
+codes/opcode extensions. `_pack_imm32(value, location)` validates and packs a
+signed 32-bit value for arithmetic; shared validation calls it during sizing
+as well. The encoder checks register metadata independently of the parser, so manually
+constructed mismatched registers cannot silently select another destination.
+
+Future helper designs (not implemented in this milestone):
+
+- `_pack_signed(value, bits, location)` will check signed ranges and use
+  explicit little-endian formats if additional signed widths become necessary.
+
+Symbolic MOV uses the existing `SymbolReference` and symbol mapping without
+changing public interfaces. Branch handlers use the existing address and
+mapping arguments and the existing SymbolReference model. The resolver owns
+instruction/data layout, label collection and branch-boundary validation;
+the unchanged ELF writer consumes the separate payloads. No additional
+executable format or instruction family is implemented.
 
 Important fixed choices:
 
 - register-to-register operations use 64-bit operand size (`REX.W=1`);
 - `MOV r64, imm64` uses `REX.W + B8+rd + imm64`;
-- immediate arithmetic prefers a documented deterministic form; size decisions
-  must be identical in `encoded_size()` and `encode()`;
+- immediate arithmetic uses fixed seven-byte `81` forms; size decisions
+  are identical in `encoded_size()` and `encode()`;
 - `JMP` uses `E9 rel32`; `JE` uses `0F 84 rel32`; `JNE` uses `0F 85 rel32`;
 - `SYSCALL` uses `0F 05`;
 - all multibyte values are little endian.

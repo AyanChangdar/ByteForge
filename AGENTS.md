@@ -20,6 +20,10 @@ demonstration.
   explicitly expands scope.
 - Do not add CPU emulation, KVM, a web framework, a GUI framework, databases,
   or package dependencies.
+  Limited exception: TraceLab may provide a bounded educational simulator of
+  ByteForge's existing typed instruction subset. This does not permit a general
+  x86 emulator, machine-code decoding/execution, external VMs, or replacement
+  of native ELF generation.
 - Do not commit, push, rewrite history, or modify files outside this repository
   unless explicitly requested.
 

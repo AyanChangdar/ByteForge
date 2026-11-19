@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="ByteForge TraceLab — explore handwritten x86-64 machine code and simulated CPU state.">
+  <title>ByteForge · TraceLab</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="#home" aria-label="ByteForge home">
+      <svg class="brand-mark" viewBox="0 0 32 32" fill="none" aria-hidden="true"><rect x="7" y="7" width="18" height="18" rx="4"/><path d="M12 1v6m8-6v6M12 25v6m8-6v6M1 12h6m-6 8h6m18-8h6m-6 8h6M12 12h8v8h-8z"/></svg>
+      <span>ByteForge <span class="brand-sub">TraceLab</span></span>
+    </a>
+    <nav class="main-nav" aria-label="Main navigation">
+      <a href="#home" data-page="home" aria-current="page">Home</a>
+      <a href="#playground" data-page="playground">Playground</a>
+      <a href="#instructions" data-page="instructions">Instruction Set</a>
+      <a href="#cli-guide" data-page="cli-guide">CLI Guide</a>
+    </nav>
+    <span class="connection" id="connection"><span class="status-dot"></span><span id="connection-text">Connecting</span></span>
+  </header>
+
+  <main id="main" tabindex="-1">
+    <section id="page-home" class="page home-page" aria-labelledby="home-title">
+      <div class="home-grid">
+        <div class="hero-copy">
+          <p class="eyebrow"><span class="small-square"></span> INSIDE THE INSTRUCTION</p>
+          <h1 id="home-title">Assembly,<br>made <span>visible.</span></h1>
+          <p class="hero-description">Write x86-64. Inspect the real machine bytes. Step through every change in a simulated CPU.</p>
+          <div class="hero-actions"><a class="button primary" href="#playground">Open Playground <span aria-hidden="true">↗</span></a><a class="text-link" href="#instructions">Explore the instruction set <span aria-hidden="true">→</span></a></div>
+          <div class="hero-tags"><span>x86-64</span><span>Native Linux ELF64</span><span>Handwritten assembler</span></div>
+        </div>
+        <div class="home-preview panel">
+          <div class="panel-heading"><span><span class="file-icon" aria-hidden="true">&lt;/&gt;</span> loop.asm</span><span class="subtle-label">SOURCE</span></div>
+          <pre id="home-source" class="preview-code">Loading the loop example…</pre>
+          <div class="pipeline"><span>Assembly</span><b aria-hidden="true">→</b><span>Machine bytes</span><b aria-hidden="true">→</b><span>ELF64</span></div>
+          <div class="preview-note"><span class="status-dot"></span> Real assembly. Simulated tracing.</div>
+        </div>
+      </div>
+      <div class="section-heading"><div><p class="eyebrow">START WITH A WORKING PROGRAM</p><h2>Small programs. Clear effects.</h2></div><span class="muted">Choose an example to explore.</span></div>
+      <div id="example-cards" class="example-cards" aria-label="Available examples"><p class="muted">Connecting to the local example library…</p></div>
+      <div class="boundary-note"><span class="note-icon" aria-hidden="true">i</span><p><strong>Two different ways to learn.</strong> The assembler creates real Linux executables. TraceLab interprets the supported instructions in Python; this browser never runs your native binary or reads hardware registers.</p></div>
+    </section>
+
+    <section id="page-playground" class="page" aria-labelledby="playground-title" hidden>
+      <div class="workspace-title"><div><p class="eyebrow">YOUR ASSEMBLY WORKSPACE</p><h1 id="playground-title">TraceLab <span>Interactive x86-64 Assembly Explorer</span></h1></div><span class="mode-badge">SIMULATED EXECUTION</span></div>
+      <div class="toolbar" aria-label="Execution controls">
+        <label class="example-control">Program<select id="example-select" aria-label="Example program" disabled><option>Loading examples…</option></select></label>
+        <button id="assemble" class="button primary" disabled title="Assemble (Ctrl+Enter)"><span aria-hidden="true">⌘</span> Assemble</button>
+        <div class="execution-controls">
+          <button id="back" class="button" disabled title="Step backward (Shift+F10)"><span aria-hidden="true">↶</span> Back</button>
+          <button id="step" class="button" disabled title="Step forward (F10)">Step <span aria-hidden="true">→</span></button>
+          <button id="play" class="button play-button" disabled title="Play or pause (F9)">▶ Play</button>
+          <button id="reset" class="button quiet" disabled>Reset</button>
+        </div>
+        <label class="speed-control">Speed<select id="speed" aria-label="Playback speed"><option value="1000">1 step/s</option><option value="500" selected>2 steps/s</option><option value="250">4 steps/s</option><option value="125">8 steps/s</option></select></label>
+        <span id="execution-status" class="status-badge" role="status">Not assembled</span>
+      </div>
+      <div id="notice" class="notice" role="status">Choose a program or edit the source, then Assemble to begin.</div>
+      <div id="diagnostic" class="diagnostic" role="alert" hidden><strong id="diagnostic-title"></strong><pre id="diagnostic-text"></pre><button id="diagnostic-jump" class="text-button">Go to source location →</button></div>
+
+      <div class="workspace-grid">
+        <section class="panel editor-panel" aria-labelledby="editor-title">
+          <div class="panel-heading"><h2 id="editor-title"><span class="panel-number">01</span> Assembly editor</h2><span id="source-filename" class="mono muted">loop.asm</span></div>
+          <div class="editor-shell">
+            <div class="line-gutter" aria-hidden="true"><div id="line-numbers"></div></div>
+            <div class="editor-code"><div id="highlight-viewport" class="highlight-viewport" aria-hidden="true"><div id="highlight-rows"></div></div><textarea id="source" aria-label="Assembly source" aria-describedby="editor-help" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off" disabled></textarea></div>
+          </div>
+          <div id="editor-help" class="editor-footer"><span><i class="legend-dot next-dot"></i> Next instruction <i class="legend-dot last-dot"></i> Last executed</span><span id="source-position">Ln 1, Col 1</span></div>
+        </section>
+        <section class="panel cpu-panel" aria-labelledby="cpu-title">
+          <div class="panel-heading"><h2 id="cpu-title"><span class="panel-number">02</span> CPU state</h2><span class="subtle-label">SIMULATED</span></div>
+          <div id="registers" class="register-grid"></div>
+          <div class="cpu-special"><div><span class="subtle-label">RIP · NEXT ADDRESS</span><code id="rip">—</code></div><div class="flag"><span class="subtle-label">ZERO FLAG</span><strong id="zf">—</strong></div></div>
+          <div class="execution-context"><div><span class="subtle-label">NEXT TO EXECUTE</span><p id="next-instruction">Assemble to inspect CPU state.</p></div><div><span id="last-label" class="subtle-label">LAST EXECUTED</span><p id="last-instruction">No instructions executed yet.</p></div><div id="branch-info" class="branch-info" hidden></div></div>
+          <div class="cpu-footer"><span id="step-count">0 executed steps</span><span>Changed values <i class="legend-dot next-dot"></i></span></div>
+        </section>
+      </div>
+
+      <section class="panel instruction-panel" aria-labelledby="instruction-title"><div class="instruction-summary"><div><p class="eyebrow" id="instruction-title">03 / INSTRUCTION DETAIL</p><h2 id="selected-source">Source → bytes → CPU state</h2><p id="selected-meta" class="muted">Assemble a program, then select an instruction or start stepping.</p></div><span id="selected-mnemonic" class="instruction-badge">—</span></div><code id="selected-bytes" class="instruction-bytes">Awaiting machine code</code><p id="selected-context" class="muted">Exact bytes come from the handwritten Python encoder.</p></section>
+
+      <section class="panel inspector" aria-label="Program inspectors">
+        <div class="inspector-tabs" role="tablist" aria-label="Inspector panels">
+          <button id="tab-bytes" role="tab" aria-selected="true" aria-controls="panel-bytes" data-tab="bytes">Machine Bytes</button>
+          <button id="tab-symbols" role="tab" aria-selected="false" aria-controls="panel-symbols" tabindex="-1" data-tab="symbols">Symbols</button>
+          <button id="tab-memory" role="tab" aria-selected="false" aria-controls="panel-memory" tabindex="-1" data-tab="memory">Memory / DB Data</button>
+          <button id="tab-output" role="tab" aria-selected="false" aria-controls="panel-output" tabindex="-1" data-tab="output">Output Console <span id="output-count" class="count-badge">0 B</span></button>
+          <button id="tab-timeline" role="tab" aria-selected="false" aria-controls="panel-timeline" tabindex="-1" data-tab="timeline">Execution Timeline</button>
+        </div>
+        <section id="panel-bytes" role="tabpanel" aria-labelledby="tab-bytes" tabindex="0"><div class="inspector-heading"><p id="assembly-summary">Actual instruction bytes and virtual addresses.</p><span class="legend"><i class="legend-dot next-dot"></i> Next <i class="legend-dot last-dot"></i> Last</span></div><div id="machine-bytes" class="table-scroll"><p class="empty-state">Assemble your source to inspect its machine code.</p></div></section>
+        <section id="panel-symbols" role="tabpanel" aria-labelledby="tab-symbols" tabindex="0" hidden><div class="inspector-heading"><p>Case-sensitive symbols resolved by the assembler.</p></div><div id="symbols" class="table-scroll"><p class="empty-state">No assembled symbol table.</p></div></section>
+        <section id="panel-memory" role="tabpanel" aria-labelledby="tab-memory" tabindex="0" hidden><div class="inspector-heading"><p id="memory-summary">Read-only bytes defined by DB directives.</p><div class="pagination"><button id="memory-prev" class="button small" disabled>← Previous</button><button id="memory-next" class="button small" disabled>Next →</button></div></div><div id="memory" class="table-scroll"><p class="empty-state">Assemble a program with DB data to inspect memory.</p></div></section>
+        <section id="panel-output" role="tabpanel" aria-labelledby="tab-output" tabindex="0" hidden><div class="inspector-heading"><p id="output-summary">Captured simulated stdout · no native process</p><span id="exit-status" class="muted">Not exited</span></div><pre id="output" class="output-console empty-state">No simulated output yet.</pre><details class="raw-output"><summary>Raw bytes and escaped representation</summary><pre id="output-raw">No output bytes.</pre></details></section>
+        <section id="panel-timeline" role="tabpanel" aria-labelledby="tab-timeline" tabindex="0" hidden><div class="inspector-heading"><p id="timeline-summary">Recorded transitions from the shared trace engine.</p><div class="pagination"><button id="timeline-prev" class="button small" disabled>← Previous</button><button id="timeline-next" class="button small" disabled>Next →</button></div></div><div id="timeline" class="table-scroll"><p class="empty-state">Step through a program to build its timeline.</p></div></section>
+      </section>
+      <div class="workspace-footnote"><span>F10 Step · Shift+F10 Back · F9 Play/Pause · Ctrl+Enter Assemble</span><span>All CPU and memory values shown here are simulated.</span></div>
+    </section>
+
+    <section id="page-instructions" class="page reading-page" aria-labelledby="instructions-title" hidden><p class="eyebrow">THE IMPLEMENTED SUBSET</p><h1 id="instructions-title">A small instruction set.<br>A real assembler.</h1><p class="reading-intro">ByteForge implements these forms for eight base 64-bit registers. It does not claim support for the full x86-64 ISA.</p><div class="panel table-scroll"><table><thead><tr><th>Instruction</th><th>Supported form</th><th>Encoded size</th></tr></thead><tbody><tr><td>MOV</td><td>r64, integer or symbol address</td><td>10 bytes</td></tr><tr><td>ADD / SUB / CMP</td><td>r64, signed imm32</td><td>7 bytes</td></tr><tr><td>XOR</td><td>r64, r64</td><td>3 bytes</td></tr><tr><td>JMP</td><td>code label · fixed rel32</td><td>5 bytes</td></tr><tr><td>JE / JNE</td><td>code label · fixed rel32</td><td>6 bytes</td></tr><tr><td>SYSCALL</td><td>no operands</td><td>2 bytes</td></tr><tr><td>DB</td><td>ASCII strings and numeric bytes, after code</td><td>Length of data</td></tr></tbody></table></div><p class="register-reference mono">RAX · RBX · RCX · RDX · RSI · RDI · RBP · RSP</p><div class="boundary-note"><span class="note-icon">i</span><p>TraceLab models ZF, stdout write (syscall 1) and exit (60). Other syscalls and memory outside mapped DB data fault explicitly. Detailed opcode fields are reserved for the next educational milestone.</p></div><button class="button primary" data-example="arithmetic">Try Arithmetic in Playground →</button></section>
+
+    <section id="page-cli-guide" class="page reading-page" aria-labelledby="cli-title" hidden><p class="eyebrow">ONE ASSEMBLER. TWO WAYS TO EXPLORE.</p><h1 id="cli-title">From the terminal.</h1><p class="reading-intro">Python 3.10+ and the standard library. No assembler, linker, package install or frontend build step.</p><div class="guide-grid"><article class="panel guide-card"><span class="panel-number">01 / BUILD A NATIVE ELF</span><h2>Assemble a file</h2><pre>python -m byteforge.cli examples/hello.asm -o build/hello</pre><p>Works on Windows and Linux. Choose a fresh output path: existing files are not overwritten. Run the executable only on Linux x86-64 or compatible WSL.</p><pre>chmod +x build/hello
+./build/hello</pre></article><article class="panel guide-card"><span class="panel-number">02 / TRACE WITHOUT NATIVE EXECUTION</span><h2>Open the debugger</h2><pre>python -m byteforge.trace_cli examples/loop.asm --interactive</pre><p>Available on Windows and Linux. Use <code>next</code>, <code>back</code>, <code>registers</code>, <code>memory ADDRESS LENGTH</code>, <code>continue</code>, <code>reset</code> and <code>quit</code>.</p><p>Simulated exit status is separate from the debugger's process exit code.</p></article></div><article class="panel guide-card"><span class="panel-number">03 / OPEN TRACELAB</span><h2>The same engine, in your browser</h2><pre>python -m byteforge.trace_server --port 8765</pre><p>Open <code>http://127.0.0.1:8765</code>. The server is loopback-only. Keep it running while you explore; stop it with Ctrl+C.</p><a class="text-link" href="#playground">Back to Playground →</a></article></section>
+  </main>
+  <footer class="site-footer"><span>ByteForge <span class="muted">/</span> TraceLab</span><span>Handwritten x86-64 · Python engine · Local only</span></footer>
+  <noscript><p class="notice">TraceLab needs JavaScript to connect to the local Python API. The assembler and terminal debugger remain available without it.</p></noscript>
+</body>
+</html>
