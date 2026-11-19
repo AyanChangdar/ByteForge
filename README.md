@@ -1,56 +1,199 @@
 # ByteForge
 
-ByteForge is an educational, handwritten x86-64 assembler and native Linux
-ELF64 executable generator. It translates a deliberately small assembly
-language directly into machine-code bytes and packages the result as a
-fixed-address executable without invoking NASM, GAS, GCC, or an external linker.
+**A handwritten x86-64 assembler, native Linux ELF64 generator, and educational assembly explorer.**
 
-The project is designed for a three-person, three-day Computer Organization
-and Architecture demonstration. Its scope is intentionally limited to a
-documented subset of `MOV`, `ADD`, `SUB`, `XOR`, `CMP`, `JMP`, `JE`, `JNE`, and
-`SYSCALL`, essential 64-bit registers, decimal/hexadecimal immediates, labels,
-comments, and a string-data directive.
+ByteForge translates a small assembly language directly into machine-code bytes
+and packages them as a fixed-address Linux executable. TraceLab adds browser
+and terminal interfaces for inspecting those same instructions through a
+bounded Python simulation.
 
-## Planned pipeline
+The project is built for Computer Organization and Architecture education.
+Its implementation uses Python's standard library, HTML, CSS, and vanilla
+JavaScript. No external assembler, linker, frontend build step, or runtime
+package installation is required.
 
-```text
-source.asm -> parser -> symbol/layout passes -> x86-64 encoder
-           -> machine code + data -> ELF64 writer -> native executable
-                                    -> JSON report -> HTML visualizer
+- Handwritten encoding for MOV, ADD, SUB, XOR, CMP, JMP, JE, JNE, and SYSCALL.
+- Two-pass layout with case-sensitive labels, forward references, and DB data.
+- Deterministic, sectionless Linux x86-64 ELF64 executables.
+- Source-located errors with filename, line, column, original text, and caret.
+- Shared TraceSession engine with reversible history and modeled write/exit.
+- Local browser Playground with CPU state, actual bytes, symbols, DB memory,
+  captured output, and an execution timeline.
+
+## Application Preview
+
+![ByteForge TraceLab homepage with navigation, Open Playground and a loop source preview](docs/ss/01-dashboard.png)
+
+*Figure 1. TraceLab Home, with the Open Playground action, source preview and example selector below.*
+
+[Quick Start](#local-quick-start) · [Instruction forms](#supported-assembly-language) ·
+[Troubleshooting](#troubleshooting) · [Contributing](#contributing-and-reporting-issues)
+
+<details>
+<summary>Contents</summary>
+
+- [Local Quick Start](#local-quick-start)
+- [Requirements and WSL execution](#requirements)
+- [Example programs](#example-programs)
+- [Architecture](#architecture)
+- [Handwritten encoding](#handwritten-x86-64-encoding)
+- [ELF64 layout and addresses](#elf64-layout-and-addresses)
+- [Supported assembly language](#supported-assembly-language)
+- [Browser and terminal tracing](#browser-and-terminal-tracing)
+- [Local API and security](#local-api-and-security)
+- [Testing and validation](#testing-and-validation)
+- [Troubleshooting](#troubleshooting)
+- [Repository layout](#repository-layout)
+- [Release, deployment and screenshots](#release-deployment-and-screenshots)
+- [Contributing and reporting issues](#contributing-and-reporting-issues)
+- [References and attribution](#references-and-attribution)
+- [License](#license)
+
+</details>
+
+## Local Quick Start
+
+### Obtain a checkout
+
+The verified repository is [AyanChangdar/ByteForge](https://github.com/AyanChangdar/ByteForge).
+It is currently private; cloning requires authorized GitHub access. The older
+configured origin under `AP24110010120` resolves to this repository.
+
+```bash
+git clone https://github.com/AyanChangdar/ByteForge.git
+cd ByteForge
 ```
 
-Stage 5B.2 implements source parsing, two-pass code/data layout, label
-collection, MOV-immediate/symbol, fixed-imm32 ADD/SUB/CMP, register XOR,
-JMP/JE/JNE rel32 branches, SYSCALL encoding, ELF generation and a CLI.
-A case-sensitive `_start` label must identify an instruction. DB bytes follow
-instructions; any instruction after the first DB (even `db ""`) is rejected.
-Structured reports and the browser TraceLab Playground are implemented.
+An existing checkout or authorized source archive can also be used. Run the
+commands below from the directory containing `README.md`, `byteforge/`,
+`examples/` and `visualizer/`.
 
-The HTML/CSS/JavaScript Playground displays source, virtual addresses, actual
-encoded bytes, symbols, read-only DB data and simulated CPU execution. The
-browser and terminal debugger share the same bounded Python trace engine;
-neither runs the generated ELF. Detailed opcode and ELF exploration remain
-deferred to Stage 6C.
+> [!NOTE]
+> Python 3.10 or newer is required. No `pip install`, Node.js, npm, or frontend
+> build is needed. Commands below use `python`; use `python3` on Linux/WSL or
+> `py -3` on Windows if that is your Python 3.10+ command.
 
-## Usage (Stage 5B.2)
+### Open the browser Playground
 
-Python 3.10 or newer is required to build files; no packages are needed.
-From the repository root:
+```bash
+python --version
+python -m byteforge.trace_server --port 8765
+```
+
+Open **http://127.0.0.1:8765**. Use this exact loopback address: the server
+validates the Host header and does not accept `localhost` as an alias.
+
+1. Open **Playground** and select `loop.asm`.
+2. Click **Assemble**, then **Step** to see RCX become `0x0000000000000003`.
+3. Click **Play** to reach simulated exit status 7.
+4. Load and assemble `hello.asm`, then Play and open **Output Console** to see
+   `Hello, World!` followed by a newline, with simulated exit status 0.
+
+Keep the terminal running while using the website. Stop the server with Ctrl+C.
+
+### Open the terminal debugger
+
+```bash
+python -m byteforge.trace_cli examples/loop.asm --interactive
+```
+
+Enter `next`, `registers`, `continue`, `back`, `reset`, or `help`.
+Use `quit` to leave the debugger.
+
+### Generate a native executable
+
+```bash
+python -m byteforge.cli examples/hello.asm -o build/hello
+```
+
+The assembler creates missing output directories and refuses to overwrite
+existing files. If `build/hello` already exists, choose another output name.
+
+Run this bundled example only on Linux x86-64 or compatible x86-64 WSL:
+
+```bash
+chmod +x build/hello
+./build/hello
+echo $?                 # expected: 0
+```
+
+Expected stdout is `Hello, World!` followed by a newline.
+
+> [!IMPORTANT]
+> Native execution and TraceLab are different paths. The browser and debugger
+> simulate the supported instructions; they do not execute the generated ELF
+> or inspect hardware registers. Windows can generate ELF files but cannot
+> run them directly. Native ELF execution requires compatible Linux x86-64.
+
+## Requirements
+
+| Activity | Requirements |
+|---|---|
+| Assemble ELF files | Python 3.10+, standard library, Windows or Linux/WSL |
+| Use terminal tracing | The same Python installation; no native execution required |
+| Use browser tracing | The local Python server and a modern browser with JavaScript, modules, and BigInt |
+| Execute generated ELF | Linux x86-64, including compatible x86-64 WSL |
+| Run tests | Python `unittest`; native tests skip on incompatible platforms |
+
+Generated executables contain machine code and data and do not depend on
+Python, a dynamic loader, or an installed assembler. ByteForge does not provide
+an ARM-native executable target or a Windows PE executable target.
+
+### Native execution from WSL
+
+Use a Linux shell inside your WSL distribution for native execution, rather
+than invoking an ELF file from PowerShell. Check `uname -m`; the examples
+require an x86-64 Linux environment. A Windows Python installation does not
+replace the Python installation used inside WSL.
+
+Prefer keeping Linux build outputs under your WSL home directory. Windows
+drives can be accessed through mounted paths such as `/mnt/c`, but their
+permission behavior depends on Windows permissions and WSL metadata settings.
+`chmod` there can behave differently from permissions on the Linux filesystem.
+See Microsoft's [WSL file-permissions documentation](https://learn.microsoft.com/en-us/windows/wsl/file-permissions).
+
+From the repository root in the WSL shell, build to a fresh destination:
+
+```bash
+uname -m                  # expected architecture: x86_64
+mkdir -p "$HOME/byteforge-demo"
+python3 -m byteforge.cli examples/hello.asm -o "$HOME/byteforge-demo/hello"
+chmod u+x "$HOME/byteforge-demo/hello"
+"$HOME/byteforge-demo/hello"
+echo $?                   # expected: 0
+```
+
+Choose a new output filename if that destination already exists. If the ELF
+was generated on Windows instead, copy it to a fresh destination in the WSL
+Linux filesystem and apply executable permission there before running it.
+For Linux-tool workflows, Microsoft also recommends storing project files in
+the [WSL filesystem](https://learn.microsoft.com/en-us/windows/wsl/setup/environment#file-storage).
+The five bundled native-execution tests were rerun successfully in Ubuntu/WSL
+during the screenshot integration review; see [Testing and validation](#testing-and-validation).
+
+## Example programs
+
+The repository includes five complete examples. The table describes their
+expected behavior on compatible Linux and in TraceLab's supported simulation.
+
+| Source | Stdout | Exit status | Code / data bytes | ELF bytes |
+|---|---|---:|---:|---:|
+| [exit.asm](examples/exit.asm) | Empty | 7 | 22 / 0 | 4,118 |
+| [hello.asm](examples/hello.asm) | `b"Hello, World!\n"` | 0 | 64 / 14 | 4,174 |
+| [arithmetic.asm](examples/arithmetic.asm) | Empty | 7 | 36 / 0 | 4,132 |
+| [loop.asm](examples/loop.asm) | Empty | 7 | 52 / 0 | 4,148 |
+| [conditional.asm](examples/conditional.asm) | Empty | 7 | 66 / 0 | 4,162 |
+
+All five enter at `0x401000`. Build any example with the same CLI:
 
 ```bash
 python -m byteforge.cli examples/exit.asm -o build/exit
-python -m byteforge.cli examples/hello.asm -o build/hello
 python -m byteforge.cli examples/arithmetic.asm -o build/arithmetic
 python -m byteforge.cli examples/loop.asm -o build/loop
 python -m byteforge.cli examples/conditional.asm -o build/conditional
 ```
 
-The CLI creates missing output directories and refuses to overwrite an
-existing output or the source file. It sets owner-execute permission on POSIX.
-Assembly errors show filename, line, column, original text and a caret.
-Success returns status 0; build/file errors return 1; argument errors return 2.
-
-The exit-status-7 regression example is:
+### Minimal Linux exit
 
 ```asm
 _start:
@@ -59,227 +202,504 @@ _start:
     syscall
 ```
 
-The resulting file is 4118 bytes, with 22 code bytes at file offset `0x1000`
-and entry address `0x401000`. It has one read/execute load segment at fixed
-image base `0x400000`. No Python runtime or dynamic loader is required to run it.
+This emits 22 code bytes:
 
-Run on Linux x86-64 (including compatible WSL):
-
-```bash
-chmod +x build/exit
-./build/exit
-echo $?                 # expected: 7
+```text
+48 B8 3C 00 00 00 00 00 00 00
+48 BF 07 00 00 00 00 00 00 00
+0F 05
 ```
 
-The Hello World example uses `mov rsi, msg` to load an absolute data address
-and `msg: db "Hello, World!", 10` to define 14 bytes. Its ELF contains 64 code
-bytes followed immediately by those bytes at file offset `0x1040` / virtual
-address `0x401040`. File size is 4174 bytes and entry remains `0x401000`.
+On Linux, `./build/exit` produces no stdout and `echo $?` reports `7`.
 
-```bash
-chmod +x build/hello
-./build/hello           # prints Hello, World! followed by a newline
-echo $?                # expected: 0
-```
-
-Labels preserve case. Undefined symbols and duplicate labels produce source
-diagnostics. Numeric MOV retains its original `-2^63..2^64-1` range; symbolic
-MOV uses unsigned 64-bit virtual addresses. Both encodings are always 10 bytes.
-Strings are ASCII with the documented escape set. Data has no implicit NUL
-terminator, and syscall byte counts remain literal values in source.
-
-The arithmetic example computes exit status 7 without using branches:
+### Hello World with symbolic data
 
 ```asm
 _start:
-    xor rdi, rdi
-    add rdi, 10
-    sub rdi, 3
-    cmp rdi, 7
+    mov rax, 1
+    mov rdi, 1
+    mov rsi, msg
+    mov rdx, 14
+    syscall
+
     mov rax, 60
+    mov rdi, 0
+    syscall
+
+msg: db "Hello, World!", 10
+```
+
+The first syscall writes 14 bytes. The second exits with status 0.
+`mov rsi, msg` contains the resolved absolute address `0x401040`.
+
+![TraceLab Hello World output console after eight simulated instructions](docs/ss/08-hello-output.png)
+
+*Figure 8. Simulated Hello World after eight instructions: 14 output bytes and exit status 0. This browser view is separate from native execution.*
+
+### A backward conditional branch
+
+```asm
+_start:
+    mov rcx, 3
+
+loop:
+    sub rcx, 1
+    cmp rcx, 0
+    jne loop
+
+    mov rax, 60
+    mov rdi, 7
     syscall
 ```
 
-Its ELF is 4132 bytes, with 36 code bytes and entry `0x401000`. On Linux x86-64:
+RCX counts down to zero; JNE is taken twice and then falls through.
+The arithmetic example computes `10 - 3`; the conditional example demonstrates
+a non-taken JNE followed by a taken JE.
 
-```bash
-chmod +x build/arithmetic
-./build/arithmetic
-echo $?                 # expected: 7
+![Simulated loop after four instructions with RCX 2, ZF 0 and JNE taken](docs/ss/03-loop-taken.png)
+
+*Figure 3. After four executed instructions, RCX=2, ZF=0 and next RIP=0x40100A. JNE was taken; SUB executes next.*
+
+![Simulated loop after ten instructions with RCX 0, ZF 1 and JNE not taken](docs/ss/04-loop-termination.png)
+
+*Figure 4. After ten executed instructions, RCX=0, ZF=1 and next RIP=0x40101E. JNE was not taken; the exit setup is next and the process has not exited yet.*
+
+## Architecture
+
+```mermaid
+flowchart TD
+    S["Assembly source"] --> P["Handwritten parser: typed Program"]
+    P --> R["Two-pass resolver and handwritten encoder"]
+    R --> A["AssemblyResult: code, DB data, symbols, encoded items"]
+    A --> E["ELF64 writer"]
+    E --> F["Native Linux ET_EXEC artifact"]
+    F --> N["Optional execution on Linux x86-64"]
+
+    P --> T["Bounded TraceSession: typed instruction simulation"]
+    A --> T
+    E --> M["ELF image and layout metadata"]
+    M --> T
+    A --> J["JSON report adapter"]
+    M --> J
+    T --> C["Terminal debugger"]
+    T --> H["Loopback HTTP API: state, history, controls"]
+    J --> H
+    H --> B["TraceLab browser Playground"]
 ```
 
-ADD, SUB and CMP accept only a base 64-bit register and a signed 32-bit integer
-(`-2147483648..2147483647`). They always use seven-byte `48 81` encodings;
-the CPU sign-extends the immediate, and there is no imm8 optimization.
-XOR accepts two base registers and uses three-byte `48 31` encoding, with
-the first operand as destination. Other arithmetic forms, memory operands,
-extended registers and indirect branches remain unsupported. CMP affects flags
-only; JE branches when ZF is set, and JNE branches when ZF is clear.
+The parser preserves typed operands and source locations. Pass 1 establishes
+fixed instruction sizes and symbol addresses; pass 2 emits the final bytes.
+Instructions must precede data. The ELF writer wraps the resulting payloads.
 
-JMP, JE and JNE accept one case-sensitive code label. They always use fixed
-near rel32 forms (5, 6 and 6 bytes) with displacement calculated from the next
-instruction. Forward/backward references and instruction aliases are supported.
-Undefined labels, data targets, trailing end-of-code targets and non-instruction
-boundaries produce source diagnostics. Symbolic MOV may still reference data.
+The symbol table stores resolved virtual addresses, including forward data
+references. In `hello.asm`, `_start=0x401000` and `msg=0x401040`; these are the
+values displayed in the browser's **Symbols** tab.
 
-`loop.asm` counts RCX from 3 to zero with SUB/CMP/JNE and exits with status 7.
-Its backward JNE is `0F 85 EC FF FF FF` (displacement -20); its ELF is 4148
-bytes. `conditional.asm` demonstrates a non-taken JNE and taken JE, selecting
-exit status 7 instead of failure status 99; its ELF is 4162 bytes.
+![Hello World symbol table with resolved virtual addresses and file offsets](docs/ss/06-symbol-table.png)
 
-On Linux x86-64, after generating the files:
+*Figure 6. Hello World's resolved symbols: _start=0x401000 and msg=0x401040, at file offsets 0x1000 and 0x1040.*
 
-```bash
-chmod +x build/loop build/conditional
-./build/loop
-echo $?                 # expected: 7
-./build/conditional
-echo $?                 # expected: 7
+Tracing interprets the parsed instructions using the assembled addresses and
+bytes as metadata. The browser renders API responses and sends controls to
+the same Python engine used by the terminal debugger. JavaScript does not
+reimplement assembly encoding or CPU execution.
+
+## Handwritten x86-64 encoding
+
+The encoder chooses opcodes, constructs prefixes and ModR/M bytes, checks
+ranges, and packs little-endian values directly. Product code never invokes
+NASM, GAS, GCC, `ld`, Keystone, or another external encoder.
+
+![Arithmetic example machine bytes, source instructions, virtual addresses and instruction lengths](docs/ss/05-machine-bytes.png)
+
+*Figure 5. arithmetic.asm has six instructions and 36 code bytes. Machine Bytes shows the actual encoding and size of each instruction.*
+
+| Field | ByteForge's implementation |
+|---|---|
+| REX.W | `48`: 64-bit operand size for supported MOV/arithmetic/XOR forms |
+| MOV opcode | `B8 + destination register code`; no ModR/M byte |
+| Group 1 arithmetic | `81` with ModR/M extension `/0` ADD, `/5` SUB, `/7` CMP |
+| XOR opcode | `31`; ModR/M reg is the source, r/m is the destination |
+| imm64 | Eight little-endian bytes; used by numeric and symbolic MOV |
+| imm32 | Four signed little-endian bytes; sign-extended by the CPU |
+| rel32 | Four signed little-endian bytes relative to the following instruction |
+
+Base register codes are `RAX=0, RCX=1, RDX=2, RBX=3, RSP=4, RBP=5, RSI=6, RDI=7`.
+Register-direct ModR/M is `0xC0 | (reg_or_extension << 3) | destination_code`.
+
+Numeric MOV accepts `-2^63..2^64-1`; negative values use their 64-bit
+two's-complement representation. Arithmetic accepts exactly
+`-2147483648..2147483647`, with no automatic imm8 optimization.
+
+Branches use fixed near forms: `E9 rel32`, `0F 84 rel32`, and `0F 85 rel32`.
+Their displacement is:
+
+```text
+rel32 = target virtual address - (instruction virtual address + instruction size)
 ```
 
-There is no short-jump optimization, branch relaxation or support for numeric,
-register, memory or expression branch targets. Branching does not change the
-existing instruction-before-data restriction.
+In the loop example, JNE at `0x401018` targets `0x40100A`:
 
-Windows can generate the same ELF file but cannot execute it directly. Copy
-it to Linux/WSL and apply executable permissions there if necessary. The CLI
-only builds files; it never runs generated programs.
-
-## TraceLab terminal debugger (Stage 6A.2)
-
-On Windows PowerShell or Linux/WSL, from the repository root:
-
-```bash
-python -m byteforge.trace_cli examples/loop.asm --interactive
-python -m byteforge.trace_cli examples/hello.asm --interactive
+```text
+0x40100A - 0x40101E = -20
+bytes: 0F 85 EC FF FF FF
 ```
 
-Use `next`/`n`, `back`, `registers`, `memory ADDRESS [LENGTH]`,
-`continue`/`c [STEPS]`, `reset`, `help`, and `quit`/`q`. For Hello World,
-`memory 0x401040 14` inspects the DB bytes, and `continue` captures exactly
-`b"Hello, World!\n"` with simulated exit status 0. The loop and conditional
-examples simulate exit status 7. Debugger quit/EOF returns 0 independently of
-that simulated status; Ctrl+C returns 130.
+The encoder's `encoded_size()` and `encode()` share form validation.
+The resolver verifies emitted lengths against planned sizes. Short jumps and
+branch relaxation are not implemented.
 
-This is **SIMULATED CPU STATE**, starting with zero registers and ZF=false,
-not Linux process-entry registers or hardware inspection. Only ByteForge's
-existing typed instructions and modeled stdout write/exit syscalls are traced.
-Successful syscalls set RCX to the following instruction address; ZF is
-preserved, and R11/full RFLAGS are not modeled. Other syscalls, descriptors and
-unmapped memory accesses fault explicitly. Captured output is displayed as a
-byte string; the engine does not print or invoke OS syscalls.
+## ELF64 layout and addresses
 
-Back restores registers, RIP, flags, halt/exit state and visible output.
-Forward reuses cached history; reset clears history and output. Defaults cap
-source/output at 64 KiB each, instructions at 2,048, executed steps/history
-transitions at 10,000, continue requests at 100 steps and memory inspections
-at 256 bytes. The browser is available below; detailed opcode inspection is deferred.
-See [TraceLab contracts](docs/TRACELAB.md) for exact limits and semantics.
+ByteForge writes little-endian ELF64 with `struct`, using `ET_EXEC` and
+`EM_X86_64`. It emits one `PT_LOAD` segment with read/execute permissions,
+alignment `0x1000`, file offset 0, and virtual/physical base `0x400000`.
 
-## TraceLab Playground and local API (Stage 6B.2)
+| File region | File offset | Virtual address | Size |
+|---|---:|---:|---:|
+| ELF64 header | `0x0000` | `0x400000` | 64 bytes |
+| Program header | `0x0040` | `0x400040` | 56 bytes |
+| Zero padding | `0x0078` | `0x400078` | 3,976 bytes |
+| Machine code | `0x1000` | `0x401000` | Encoded code length |
+| DB data | Immediately after code | Immediately after code in memory | DB byte length |
 
-```bash
-python -m byteforge.trace_server --port 8765
+For the single segment:
+
+```text
+virtual address = 0x400000 + file offset
+data address    = 0x401000 + total code size + offset within DB data
+file size       = 0x1000 + code size + data size
+p_filesz        = p_memsz = complete file size
 ```
 
-Open **http://127.0.0.1:8765** in your browser. The server binds only to loopback
-and serves four allowlisted visualizer files, never the repository directory.
-Stop with Ctrl+C. Python's standard library
-is sufficient on Windows and Linux/WSL; no generated native binary is run.
+The ELF entry is the resolved, case-sensitive `_start` label. It must identify
+an actual instruction boundary, including when other instructions precede it.
+It is not hardcoded to the first instruction.
 
-Fetch `GET /api/bootstrap` for schema version 1, the process mutation token,
-limits and current session/revision. Send `X-ByteForge-Token` and JSON bodies
-on POSTs. Initial `POST /api/assemble` accepts source, a display filename,
-`session_id: null` and `revision: 0`. Subsequent assembly/trace requests must
-send the current session ID and revision; stale requests return 409.
+There is no section-header table, interpreter, dynamic linker, relocation
+table, PIE, or BSS region. Code and DB data share the one RX segment; DB memory
+is not writable. The ELF regions above are not separate ELF sections.
 
-Available routes are `GET /api/bootstrap`, `GET /api/examples`,
-`POST /api/assemble`, `POST /api/trace`, `GET /api/state`, `GET /api/timeline`,
-`GET /api/memory`, and `GET /api/elf`. Trace supports next/back/reset/bounded
-continue over the same engine as the terminal debugger. Timeline, DB memory
-and ELF reads require current session/revision query parameters. ELF is an
-optional download only. Source/bytes/output remain data, never executed HTML.
+For Hello World, code is 64 bytes and data is 14 bytes:
+`msg` is at file offset `0x1040` / virtual address `0x401040`, and the complete
+ELF is 4,174 bytes.
 
-Machine values and addresses use exact hex strings; binary output includes
-lossless hex and an escaped display string. The server enforces exact local
-Host/Origin, POST tokens, existing trace limits, bounded requests/pages and
-short connection deadlines. It does not enable CORS or launch subprocesses.
-This is for local development, not public hosting. See the
-[endpoint schemas and security boundary](docs/TRACELAB.md#local-http-api-stage-6b1)
-before building another client.
+![Hello World read-only DB bytes at virtual address 0x401040 and file offset 0x1040](docs/ss/07-db-memory.png)
 
-The single-page site has Home, Playground, Instruction Set and CLI Guide.
-Load an example, click Assemble, then Step or Play. Back restores saved state
-and output; Reset clears history. Play never overlaps mutation requests, and
-Pause prevents the next scheduled step (an in-flight step may finish).
-The editor shows the next instruction in teal and the last executed line in
-amber. Selecting a machine-byte row inspects it without changing execution.
+*Figure 7. All 14 Hello World DB bytes, starting at virtual address 0x401040 / file offset 0x1040. The final 0A is a newline, shown as a dot in the ASCII column.*
 
-Editing source or changing examples clears the old displayed trace and
-requires reassembly. Stale revisions stop playback and refresh server context;
-reassemble to bind the editor again. Source text, bytes, state, output and
-timeline all come from the Python API. Binary stdout retains its exact hex
-alongside a UTF-8 or escaped preview. All rendered source/output is safe text.
+![Ubuntu terminal showing ELF64 header and load-segment inspection and native Hello World execution](docs/ss/09-elf-native.png)
 
-Keyboard shortcuts: Ctrl+Enter Assemble, F10 Step, Shift+F10 Back, F9
-Play/Pause. Inspector tabs also support arrow keys, Home and End. The layout
-stacks on small screens. No Node/npm, build step, external font or CDN is used.
-The [browser acceptance checklist](docs/TRACELAB.md#browser-acceptance-checklist)
-documents the main flows. Advanced opcode fields and the ELF explorer remain
-Stage 6C work.
+*Figure 9. Captured Ubuntu/WSL verification with file and readelf: ELF64, little-endian, x86-64 ET_EXEC, entry 0x401000 and one RX LOAD segment. Native execution prints Hello, World! and returns status 0.*
 
-## Development
+## Supported assembly language
+
+| Instruction/directive | Accepted operands | Size |
+|---|---|---:|
+| MOV | Base `r64, integer` | 10 bytes |
+| MOV | Base `r64, symbol` | 10 bytes |
+| ADD | Base `r64, signed imm32` | 7 bytes |
+| SUB | Base `r64, signed imm32` | 7 bytes |
+| CMP | Base `r64, signed imm32` | 7 bytes |
+| XOR | Base `r64, r64` | 3 bytes |
+| JMP | Code label | 5 bytes |
+| JE | Code label; branch when ZF=1 | 6 bytes |
+| JNE | Code label; branch when ZF=0 | 6 bytes |
+| SYSCALL | No operands | 2 bytes |
+| DB | ASCII strings and integers in `0..255`, after instructions | Data length |
+
+Only `RAX, RBX, RCX, RDX, RSI, RDI, RBP, RSP` are supported, all at 64-bit width.
+
+- Mnemonics/registers are case-insensitive; labels preserve spelling and case.
+- Labels start with an ASCII letter or underscore, followed by ASCII letters,
+  digits, or underscores. Only one label is allowed per source line.
+- Blank lines, whitespace, semicolon comments, signed decimal and hexadecimal
+  integers, and labels preceding an instruction/directive on the same line work.
+- DB strings use double quotes and support `\\`, `\"`, `\n`, `\r`, `\t`,
+  and `\0`. Data has no implicit NUL terminator; `db ""` represents empty data.
+- Duplicate/undefined labels and invalid operand forms produce diagnostics.
+- Branches must target instruction boundaries, not data or end-of-code labels.
+  Symbolic MOV may reference code or data addresses.
+- No instruction may follow the first DB directive, even an empty one.
+
+Unsupported forms include register-to-register MOV, register-register
+ADD/SUB/CMP, XOR immediates, memory operands, R8-R15, narrower registers,
+indirect branches, expressions, macros, user-defined sections and other
+instruction mnemonics. String lengths and syscall byte counts are literal;
+expressions such as `message_end - message` are not evaluated.
+
+## Browser and terminal tracing
+
+TraceLab starts all eight registers at zero, RIP at the resolved entry,
+ZF=false, with empty output and no exit status. These are deterministic
+educational values, not the register state supplied by Linux at process entry.
+
+Arithmetic wraps at 64 bits. MOV and branches preserve ZF; ADD, SUB, CMP and
+XOR update the modeled ZF. CMP does not modify its operands. Other CPU flags,
+a stack, writable memory and general x86 execution are not modeled.
+
+Two Linux syscall behaviors are modeled:
+
+| Number | Modeled behavior |
+|---:|---|
+| 1: write | Only fd 1; complete reads from mapped DB data; exact output capture; RAX becomes byte count |
+| 60: exit | Record `RDI & 0xFF` and halt without executing another instruction |
+
+Successful modeled syscalls set RCX to the following instruction address and
+preserve ZF as an educational simplification. R11 and full RFLAGS are not
+modeled. Zero-length writes succeed without reading memory; unsupported syscall
+numbers/descriptors, invalid ranges and exhausted limits stop explicitly.
+There is no model of partial writes, signals, errno or a full Linux kernel.
+
+### Browser workflow
+
+Home links to Playground, the supported Instruction Set overview and CLI Guide.
+The Playground provides a textarea editor with line numbers, source diagnostics,
+eight registers, RIP/ZF, next/last instruction markers and changed-value highlights.
+
+![TraceLab Playground playing loop.asm with editor, execution toolbar and eight simulated registers](docs/ss/02-playground.png)
+
+*Figure 2. The assembled loop during playback: editor, execution controls and simulated CPU panel. This capture shows four completed steps, RCX=2 and ZF=0.*
+
+Its tabs show **Machine Bytes**, **Symbols**, **Memory / DB Data**,
+**Output Console** and **Execution Timeline**. Instruction details display
+actual source, address, file offset, byte length and encoded bytes.
+
+- Assemble validates source and prepares a trace; it does not execute native code.
+- Step executes one simulated instruction; Play schedules sequential steps.
+- Pause stops future scheduling; an in-flight request may still finish.
+- Back restores saved registers, flags, RIP, output and halt/exit state.
+- Reset clears history/output and restores the initial state.
+- Editing source or changing examples invalidates displayed results and disables
+  execution until reassembly. Stale sessions also require reassembly.
+- Register/address values remain exact hexadecimal strings in JSON; raw output
+  bytes are preserved alongside a UTF-8 or escaped preview.
+
+Shortcuts: Ctrl+Enter Assemble, F10 Step, Shift+F10 Back, F9 Play/Pause.
+Inspector tabs support arrow keys, Home and End. The layout stacks on narrow screens.
+
+### Terminal commands
+
+| Command | Action |
+|---|---|
+| `next` / `n` | Advance or replay one cached transition |
+| `back` | Restore the previous saved state |
+| `registers` | Display all eight registers, RIP and ZF |
+| `memory ADDRESS [LENGTH]` | Inspect read-only DB bytes; default length 16 |
+| `continue` / `c [STEPS]` | Advance a bounded number of steps; default 100 |
+| `reset` | Clear history/output and restart |
+| `help` | Show available commands |
+| `quit` / `q` | Leave the debugger |
+
+Memory addresses/lengths accept decimal or `0x` notation. Quit/EOF returns
+debugger process status 0 independently of simulated exit status; Ctrl+C returns
+130. Source/file errors return 1 and argument errors return 2. The assembler
+CLI likewise returns 0 for success, 1 for build/file errors and 2 for arguments.
+
+![Interactive terminal debugger stepping the loop and displaying registers after a taken JNE](docs/ss/10-cli-trace.png)
+
+*Figure 10. The shared terminal trace engine after four next commands: JNE is taken to 0x40100A, RCX=2 and ZF=0. The registers command displays the simulated state.*
+
+## Local API and security
+
+The HTTP server is for local educational use. It is **not production-ready**
+and does not provide a public deployment, HTTPS/TLS or multiple independent
+user workspaces. All tabs share one active workspace.
+
+- Binds exclusively to `127.0.0.1`, validates Host, and checks Origin when supplied.
+- Requires a per-process mutation token on POST requests and current session
+  ID/revision preconditions; stale requests return HTTP 409.
+- Serializes state changes, validates JSON and enforces bounded inputs.
+- Serves only the fixed visualizer assets and five allowlisted example sources.
+- Never opens user-supplied paths, writes files, launches a shell/subprocess or
+  executes generated ELF in response to an HTTP request.
+- Uses no permissive CORS, disables access logging by default, renders user
+  content as text and sets no-store, nosniff, framing and CSP headers.
+
+| Resource | Default / hard maximum |
+|---|---:|
+| UTF-8 trace source | 65,536 bytes |
+| Assembled trace instructions | 2,048 |
+| Executed trace steps | 10,000 |
+| Saved transitions | 10,000, plus one terminal non-executed limit result |
+| Captured stdout | 65,536 bytes |
+| Continue request | 100 steps |
+| Memory inspection | 256 bytes |
+| Timeline page | 100 events |
+| HTTP body / header block / request line | 512 KiB / 16 KiB / 2,048 bytes |
+| HTTP connection deadline | 3 seconds by default; constructor permits up to 10 seconds |
+
+Trace limits may be lowered, not raised above their hard maxima. These are
+trace/API limits, not a claim that the standalone assembler CLI bounds source
+file reads. Connection deadlines can close stalled clients; they do not
+hard-preempt Python CPU work or undo already accepted mutations. The token
+does not authenticate the application against other local processes.
+
+The API exposes GET bootstrap/examples/state/timeline/memory/ELF and POST
+assemble/trace. ELF download is optional; it never executes the artifact.
+See [TraceLab contracts](docs/TRACELAB.md) for exact routes, schemas and errors.
+
+## Testing and validation
+
+Run from the repository root:
 
 ```bash
 python -m unittest discover -s tests
 ```
 
-Focused checks for this milestone:
+Focused checks:
 
 ```bash
-python -m unittest discover -s tests -p test_resolver.py
-python -m unittest discover -s tests -p test_parser.py
 python -m unittest discover -s tests -p test_encoder.py
 python -m unittest discover -s tests -p test_elf.py
-python -m unittest discover -s tests -p test_integration.py
-python -m unittest discover -s tests -p test_trace.py
-python -m unittest discover -s tests -p test_trace_cli.py
 python -m unittest discover -s tests -p test_report.py
+python -m unittest discover -s tests -p test_trace.py
 python -m unittest discover -s tests -p test_trace_server.py
 ```
 
-Structural and CLI tests run on Windows and Linux. Native tests execute only
-the fixed exit-status-7, Hello World, arithmetic, loop and conditional fixtures,
-with timeouts, on Linux
-x86-64. They are explicitly skipped elsewhere; a skip does not verify native
-execution. The Hello World test checks exact stdout `b"Hello, World!\n"`
-and return code 0; the original native exit test still checks return code 7.
-Arithmetic, loop and conditional native tests check return code 7. Regression
-tests pin the complete Hello World, exit and arithmetic ELF hashes captured
-before adding branches.
+Tests cover golden instruction bytes, immediate ranges, forward/backward
+branches, parser diagnostics, two-pass symbols, ELF fields/layout, binary
+regressions, trace semantics/history, CLI behavior, serialization and real
+temporary loopback HTTP servers. Native tests execute only the five fixed
+example fixtures with subprocess timeouts on Linux x86-64; they skip elsewhere.
 
-Optional development-only Linux checks:
+Verification snapshot, **2026-11-19**: the full Windows suite ran 367 tests:
+362 passed, 0 failed and 5 native-execution tests skipped. The five native tests
+were then run separately in Ubuntu/WSL: 5 passed, 0 failed and 0 skipped.
+All five example ELF images matched their regression hashes and existing build
+artifacts byte for byte. Test totals can change; rerun the suite for the current result.
+
+To repeat the native fixture tests from the repository root in Linux/WSL:
 
 ```bash
-file build/exit
-readelf -h -l build/exit
+python3 -B -m unittest discover -s tests -p test_integration.py -k native_linux -v
+```
+
+For browser interaction checks, use the
+[manual acceptance checklist](docs/TRACELAB.md#browser-acceptance-checklist).
+
+Optional Linux inspection tools are not ByteForge dependencies:
+
+```bash
 file build/hello
 readelf -h -l build/hello
 ```
 
-The ELF has no section table, so plain `objdump -d` may not display its code.
-None of these external validation tools are build or runtime dependencies.
+The ELF has no section table, so ordinary `objdump -d` may show no code.
 
-See [Architecture](docs/ARCHITECTURE.md) for module boundaries and the binary
-pipeline, and [Team Tasks](docs/TEAM_TASKS.md) for ownership and the three-day
-schedule.
+## Troubleshooting
 
-## Scope boundaries
+| Symptom | What to check |
+|---|---|
+| `No module named byteforge` | Run from the repository root with Python 3.10+. The module is used directly from the checkout; a package install is not required. |
+| `python` is unavailable or selects the wrong version | Check `python --version`; use `python3` on Linux/WSL or `py -3` on Windows where available. WSL uses its own Python installation. |
+| `Refusing to overwrite existing output` | Choose a new destination, for example `python -m byteforge.cli examples/hello.asm -o build/hello-new`. Existing files are deliberately preserved. |
+| The server cannot bind port 8765 | Stop your previous ByteForge server with Ctrl+C, or run `python -m byteforge.trace_server --port 8766` and open `http://127.0.0.1:8766`. |
+| HTTP 403 or the Playground cannot connect | Use the printed `http://127.0.0.1:PORT` URL. Do not substitute `localhost`, a different port, or a `file://` URL for `visualizer/index.html`. Keep the Python server running. |
+| HTTP 409 or a stale-workspace message | Another tab or request changed the shared workspace. Pause, review the editor source and reassemble before continuing. |
+| Assembly fails with a caret diagnostic | Read the filename, 1-based line/column and original source line. Check the operand matrix, immediate ranges, required `_start`, label spelling and instruction-before-DB rule. |
+| `Permission denied` when executing an ELF | Run from Linux/WSL, check executable permission and try a fresh output in the Linux home filesystem as described above. Windows-mounted permissions may differ. |
+| `Exec format error` or Windows cannot open the executable | Confirm Linux x86-64. The output is ELF64, not a Windows executable or an ARM-native program. |
+| Play stops at a fault or limit | Inspect the halt reason and timeline. Unsupported syscalls/descriptors, unmapped DB reads and resource limits stop explicitly; no successful exit is invented. |
 
-ByteForge will not implement dynamic linking, object files, macros, complex
-expressions, full x86-64 coverage, general-purpose CPU emulation, KVM integration, or external
-assembler/linker invocation. Linux x86-64 is the only execution target.
-The current assembler does not prove that arbitrary instruction sequences
-terminate or use Linux syscalls correctly. Writable data, computed expressions,
-additional arithmetic forms, other branch forms and advanced opcode/ELF
-inspectors remain deferred.
+For a syntax diagnostic, correct the source and rerun the same assembly
+command. The assembler CLI returns 1 on source/build errors and does not
+create an output file for an assembly diagnostic. Browser diagnostics point
+back to the editor; editing invalidates the old trace until reassembly.
+
+For deeper behavior and interface details, see the
+[TraceLab contracts](docs/TRACELAB.md) and
+[architecture notes](docs/ARCHITECTURE.md). Historical planning in the latter
+does not expand the implemented instruction subset.
+
+## Repository layout
+
+```text
+byteforge/
+  parser.py        Source scanning and typed statements
+  model.py         Source locations, diagnostics, assembler/ELF contracts
+  encoder.py       Handwritten fixed-size x86-64 encoding
+  resolver.py      Two-pass layout and symbol resolution
+  elf.py           In-memory ELF64 construction
+  report.py        JSON adapters over assembly and trace metadata
+  cli.py           Assembler arguments and file I/O
+  trace_model.py   Trace state, limits and snapshot contracts
+  trace.py         Pure preparation, stepping and reversible sessions
+  trace_cli.py     Interactive terminal debugger
+  trace_server.py  Loopback API and allowlisted static assets
+visualizer/
+  index.html       Home, Playground, Instruction Set and CLI Guide
+  styles.css       Responsive dark interface
+  app.js           API/workspace controls and stale-response handling
+  panels.js        Safe rendering of metadata and simulated state
+examples/          Five assembly demonstration programs
+tests/             Standard-library unittest suite
+docs/              Architecture, TraceLab contracts and historical team plan
+  ss/              Ten genuine application and terminal screenshots, with capture guide
+LICENSE            MIT license
+```
+
+Generated executables normally go into the ignored `build/` directory.
+
+## Release, deployment and screenshots
+
+This README describes the implementation currently present in the checkout:
+the assembler, terminal debugger, local API and Stage 6B.2 browser Playground.
+Detailed opcode-field explanations, a richer instruction reference and the
+advanced ELF viewer are planned Stage 6C work, not current features.
+
+No version tag or public hosted deployment was verified in this checkout.
+The supported launch target is the local Python server, not a hosted HTTPS
+Playground. The verified GitHub repository is currently private; access requires
+authorization as noted in Quick Start.
+
+Ten genuine, manually captured PNGs are included under `docs/ss/` and linked
+beside the workflows they illustrate. The [screenshot index](docs/ss/README.md)
+describes each capture. Browser and debugger images show simulated execution;
+the Ubuntu/WSL terminal image separately records native ELF inspection and
+execution. No images were generated or retouched for this documentation.
+
+## Contributing and reporting issues
+
+Keep changes focused and explainable. Read [AGENTS.md](AGENTS.md) and the
+[TraceLab contracts](docs/TRACELAB.md) before changing interfaces. Run focused
+tests for the affected component, then the complete `unittest` suite. Encoding
+changes need golden bytes and size checks; branch changes need forward/backward
+cases; layout changes need ELF field, offset and entry-point checks. Document
+any supported-form changes and preserve existing binary regressions.
+
+For a bug report, include:
+
+- OS, architecture, Python version and browser/version where relevant.
+- The exact command or browser interaction that reproduces the issue.
+- A minimal assembly example, expected behavior and actual result.
+- The complete diagnostic or halt reason, plus relevant test output.
+- Whether the result came from simulated tracing or native Linux execution;
+  report native-test skips separately from passing execution tests.
+
+Use the verified [repository](https://github.com/AyanChangdar/ByteForge)'s
+Issues or pull-request interface if your access provides it. Otherwise, share
+the report with the maintainer through your existing project channel.
+Exclude private source, credentials and mutation tokens from
+public reports. Propose changes to the instruction subset or architecture
+before undertaking a broad implementation.
+
+## References and attribution
+
+- [TraceLab documentation](docs/TRACELAB.md): implemented state, API and UI contracts.
+- [Architecture notes](docs/ARCHITECTURE.md): design rationale, encoding choices
+  and historical milestone plans; some planning sections describe deferred work.
+- [Historical team plan](docs/TEAM_TASKS.md): original project schedule and ownership.
+- [AmmAsm](https://github.com/LinuxCoder13/AmmAsm) and
+  [x86Lab](https://github.com/JBouron/x86Lab): conceptual references credited in
+  the architecture notes. Their public repository metadata was verified for
+  this README; this review does not claim a fresh audit of their source code.
+
+ByteForge's author and copyright holder is **Ayan Changdar**, as recorded in
+the repository license.
+
+## License
+
+[MIT License](LICENSE). Copyright (c) 2026 Ayan Changdar.
+
+See the license file for the complete permission, attribution and warranty terms.
